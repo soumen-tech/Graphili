@@ -1,0 +1,90 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Profile {
+  id            String   @id // matches Supabase auth.users.id
+  fullName      String
+  email         String   @unique
+  year          String?
+  department    String?
+  createdAt     DateTime @default(now())
+  experiments   ExperimentRun[]
+}
+
+model SubjectExperiment {
+  id              String   @id @default(cuid())
+  subject         String   // Physics | Electronics | Electrical
+  name            String   // e.g. "Ohm's Law"
+  aim             String
+  theoryFormal    String?  // cached Gemini output
+  theorySimple    String?  // cached Gemini output ("Explained Simply")
+  formula         String?
+  procedure       String?
+  precautions     String?
+  applications    String?
+  vivaQuestions   VivaQuestion[]
+  runs            ExperimentRun[]
+}
+
+model VivaQuestion {
+  id             String   @id @default(cuid())
+  experimentId   String
+  experiment     SubjectExperiment @relation(fields: [experimentId], references: [id])
+  category       String   // basic | conceptual | formula | tricky
+  question       String
+  answer         String
+}
+
+model ExperimentRun {
+  id             String   @id @default(cuid())
+  studentId      String
+  student        Profile  @relation(fields: [studentId], references: [id])
+  experimentId   String
+  experiment     SubjectExperiment @relation(fields: [experimentId], references: [id])
+  imageUrl       String   // Cloudinary URL of the uploaded photo
+  ocrConfidence  Float?
+  createdAt      DateTime @default(now())
+  rows           ObservationRow[]
+  graph          GraphResult?
+  report         Report?
+}
+
+model ObservationRow {
+  id             String   @id @default(cuid())
+  runId          String
+  run            ExperimentRun @relation(fields: [runId], references: [id])
+  rowIndex       Int
+  columnName     String   // e.g. "Voltage"
+  unit           String   // student-configurable, e.g. "V" or "mV"
+  value          Float
+  ocrConfidence  Float?   // per-cell confidence for the low-confidence highlight
+}
+
+model GraphResult {
+  id             String   @id @default(cuid())
+  runId          String   @unique
+  run            ExperimentRun @relation(fields: [runId], references: [id])
+  slope          Float
+  intercept      Float
+  rSquared       Float
+  xAxisMin       Float
+  xAxisMax       Float
+  yAxisMin       Float
+  yAxisMax       Float
+  suggestedScale String   // e.g. "1 small square = 0.5 V"
+  calculationText String  // worked calculation using this run's actual numbers
+}
+
+model Report {
+  id             String   @id @default(cuid())
+  runId          String   @unique
+  run            ExperimentRun @relation(fields: [runId], references: [id])
+  pdfUrl         String?
+  createdAt      DateTime @default(now())
+}
