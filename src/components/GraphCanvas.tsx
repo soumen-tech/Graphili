@@ -13,7 +13,7 @@ export const GraphCanvas = ({
   data,
   showGrid,
   showBestFit,
-  zoomLevel,
+  zoomLevel: _zoomLevel,
   col1Config,
   col2Config,
 }: GraphCanvasProps) => {
