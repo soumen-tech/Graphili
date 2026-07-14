@@ -7,6 +7,19 @@ interface GraphCanvasProps {
   zoomLevel: number;
   col1Config?: { name: string; unit: string };
   col2Config?: { name: string; unit: string };
+  xTransform?: string;
+  yTransform?: string;
+  xAxisLabel?: string;
+  yAxisLabel?: string;
+}
+
+function applyTransform(value: number, transform?: string): number {
+  if (!transform) return value;
+  switch (transform) {
+    case 'square': return value * value;
+    case 'log': return value > 0 ? Math.log10(value) : 0;
+    default: return value;
+  }
 }
 
 export const GraphCanvas = ({
@@ -16,6 +29,10 @@ export const GraphCanvas = ({
   zoomLevel: _zoomLevel,
   col1Config,
   col2Config,
+  xTransform = 'none',
+  yTransform = 'none',
+  xAxisLabel,
+  yAxisLabel,
 }: GraphCanvasProps) => {
   // SVG size parameters
   const width = 500;
@@ -25,13 +42,24 @@ export const GraphCanvas = ({
   const paddingTop = 25;
   const paddingRight = 25;
 
-  // Find data ranges
-  const maxVoltage = useMemo(() => Math.max(...data.map(d => d.voltage), 5), [data]);
-  const maxCurrent = useMemo(() => Math.max(...data.map(d => d.current), 50), [data]);
+  // Apply transformations
+  const transformedData = useMemo(() => {
+    return data.map(d => ({
+      sNo: d.sNo,
+      voltage: applyTransform(d.voltage, xTransform),
+      current: applyTransform(d.current, yTransform),
+      rawVoltage: d.voltage,
+      rawCurrent: d.current,
+    }));
+  }, [data, xTransform, yTransform]);
 
-  // Linear Regression (y = mx + c)
+  // Find data ranges based on transformed values
+  const maxVoltage = useMemo(() => Math.max(...transformedData.map(d => d.voltage), 5), [transformedData]);
+  const maxCurrent = useMemo(() => Math.max(...transformedData.map(d => d.current), 50), [transformedData]);
+
+  // Linear Regression (y = mx + c) on transformed values
   const regression = useMemo(() => {
-    const n = data.length;
+    const n = transformedData.length;
     if (n < 2) return { slope: 0, intercept: 0, r2: 0 };
     
     let sumX = 0;
@@ -40,7 +68,7 @@ export const GraphCanvas = ({
     let sumXX = 0;
     let sumYY = 0;
     
-    data.forEach(d => {
+    transformedData.forEach(d => {
       sumX += d.voltage;
       sumY += d.current;
       sumXY += d.voltage * d.current;
@@ -54,7 +82,7 @@ export const GraphCanvas = ({
     const intercept = (sumY - (slope * sumX)) / n;
     
     return { slope, intercept };
-  }, [data]);
+  }, [transformedData]);
 
   // Coordinate Conversion Functions
   const getX = (voltage: number) => {
@@ -178,7 +206,7 @@ export const GraphCanvas = ({
             className="font-heading text-xs font-bold" 
             fill="var(--color-ink-primary)"
           >
-            {col1Config ? `${col1Config.name} (${col1Config.unit})` : "Voltage (V)"}
+            {xAxisLabel || (col1Config ? `${col1Config.name} (${col1Config.unit})` : "Voltage (V)")}
           </text>
           
           <text 
@@ -189,11 +217,11 @@ export const GraphCanvas = ({
             className="font-heading text-xs font-bold" 
             fill="var(--color-ink-primary)"
           >
-            {col2Config ? `${col2Config.name} (${col2Config.unit})` : "Current (mA)"}
+            {yAxisLabel || (col2Config ? `${col2Config.name} (${col2Config.unit})` : "Current (mA)")}
           </text>
 
           {/* Best Fit Line */}
-          {showBestFit && data.length >= 2 && (
+          {showBestFit && transformedData.length >= 2 && (
             <line
               x1={getX(0)}
               y1={getY(regression.intercept)}
@@ -208,7 +236,7 @@ export const GraphCanvas = ({
 
           {/* Data Points */}
           <g>
-            {data.map((point) => {
+            {transformedData.map((point) => {
               const cx = getX(point.voltage);
               const cy = getY(point.current);
               
@@ -248,7 +276,7 @@ export const GraphCanvas = ({
                   
                   {/* Tooltip bubble inside graph */}
                   <title>
-                    {`S.No: ${point.sNo}\n${col1Config?.name || 'Voltage'}: ${point.voltage} ${col1Config?.unit || 'V'}\n${col2Config?.name || 'Current'}: ${point.current} ${col2Config?.unit || 'mA'}`}
+                    {`S.No: ${point.sNo}\n${col1Config?.name || 'X'}: ${point.rawVoltage} ${col1Config?.unit || ''}\n${col2Config?.name || 'Y'}: ${point.rawCurrent} ${col2Config?.unit || ''}${xTransform !== 'none' || yTransform !== 'none' ? `\nPlotted: (${point.voltage.toFixed(2)}, ${point.current.toFixed(2)})` : ''}`}
                   </title>
                 </g>
               );
@@ -259,3 +287,4 @@ export const GraphCanvas = ({
     </div>
   );
 };
+

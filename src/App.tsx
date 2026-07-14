@@ -27,6 +27,25 @@ import { AIExplanationBubble } from './components/AIExplanationBubble';
 import { ReportPreviewCard } from './components/ReportPreviewCard';
 import { SuggestionPanel } from './components/SuggestionPanel';
 
+// Fallback experiment list — used when the backend is unreachable.
+// Must match the seed data in server/prisma/seed.ts.
+const FALLBACK_EXPERIMENTS: api.SubjectExperiment[] = [
+  { id: 'fb-1',  subject: 'Physics',     name: 'Simple Pendulum',                     aim: 'To verify that T² ∝ L for a simple pendulum.',               formula: 'T = 2π√(L/g)' },
+  { id: 'fb-2',  subject: 'Physics',     name: "Young's Modulus",                      aim: "To determine Young's Modulus by Searle's method.",             formula: 'Y = (F × L₀) / (A × ΔL)' },
+  { id: 'fb-3',  subject: 'Physics',     name: "Hooke's Law (Spring)",                 aim: "To verify Hooke's Law and find the spring constant.",         formula: 'F = kx' },
+  { id: 'fb-4',  subject: 'Physics',     name: 'Cooling of Water',                     aim: "To verify Newton's Law of Cooling.",                          formula: 'dT/dt = -k(T - T₀)' },
+  { id: 'fb-5',  subject: 'Physics',     name: "Newton's Rings",                       aim: 'To determine the wavelength of monochromatic light.',          formula: 'D²ₙ = 4nRλ' },
+  { id: 'fb-6',  subject: 'Physics',     name: "Planck's Constant (LED)",              aim: "To determine Planck's constant using the photoelectric effect.", formula: 'eVₛ = hν - φ' },
+  { id: 'fb-7',  subject: 'Physics',     name: "Stefan's Law",                         aim: "To verify Stefan's Law by plotting log(P) vs log(T).",        formula: 'P = σAT⁴' },
+  { id: 'fb-8',  subject: 'Electrical',  name: "Ohm's Law",                            aim: "To verify Ohm's Law and calculate resistance.",               formula: 'V = IR' },
+  { id: 'fb-9',  subject: 'Electrical',  name: 'Meter Bridge',                         aim: 'To determine unknown resistance using a Meter Bridge.',       formula: 'R/S = l/(100-l)' },
+  { id: 'fb-10', subject: 'Electrical',  name: 'Potentiometer (EMF)',                   aim: 'To compare EMFs of two cells using a potentiometer.',          formula: 'E₁/E₂ = l₁/l₂' },
+  { id: 'fb-11', subject: 'Electronics', name: 'PN Junction Diode (Forward Bias)',      aim: 'To study forward bias V-I characteristics of a PN diode.',     formula: 'I = I₀(e^(V/ηVₜ) - 1)' },
+  { id: 'fb-12', subject: 'Electronics', name: 'PN Junction Diode (Reverse Bias)',      aim: 'To study reverse bias V-I characteristics and breakdown.',     formula: 'I ≈ -I₀ (constant until breakdown)' },
+  { id: 'fb-13', subject: 'Electronics', name: 'Zener Diode',                          aim: 'To study V-I characteristics of a Zener diode.',              formula: 'V_Z = constant (in breakdown region)' },
+  { id: 'fb-14', subject: 'Electronics', name: 'Optical Fibre',                        aim: 'To measure the numerical aperture of an optical fibre.',       formula: 'NA = sin(θ_max)' },
+];
+
 export default function App() {
   // Authentication states
   const [session, setSession] = useState<any>(null);
@@ -94,6 +113,11 @@ export default function App() {
   // AI Processing Checklists
   const [processingProgress, setProcessingProgress] = useState<number>(0);
   const [processingStep, setProcessingStep] = useState<number>(0);
+  const [processingError, setProcessingError] = useState<string | null>(null);
+  const [currentUploadFile, setCurrentUploadFile] = useState<File | null>(null);
+
+  // Current experiment detail (full recipe)
+  const [currentExperimentDetail, setCurrentExperimentDetail] = useState<api.SubjectExperiment | null>(null);
 
   // Settings State
   const [settingsAutoSave, setSettingsAutoSave] = useState(true);
@@ -119,15 +143,32 @@ export default function App() {
 
   // --- Auth Session Monitor ---
   useEffect(() => {
+    // Load public data immediately regardless of auth
+    fetchPublicData();
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       setAuthLoading(false);
-      if (session) fetchInitialUserData();
+      if (session) {
+        fetchInitialUserData();
+        const pending = localStorage.getItem('pendingNavigateState');
+        if (pending) {
+          setRawViewState(pending);
+          localStorage.removeItem('pendingNavigateState');
+        }
+      }
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       setSession(session);
-      if (session) fetchInitialUserData();
+      if (session) {
+        fetchInitialUserData();
+        const pending = localStorage.getItem('pendingNavigateState');
+        if (pending) {
+          setRawViewState(pending);
+          localStorage.removeItem('pendingNavigateState');
+        }
+      }
       
       if (event === 'PASSWORD_RECOVERY') {
         setAuthMode('update-password');
@@ -135,11 +176,12 @@ export default function App() {
       }
     });
 
-    // Parse URL hash for redirects (signup confirmation or password recovery)
+    // Parse URL path / hash for redirects (signup confirmation or password recovery)
     const hash = window.location.hash;
-    if (hash && hash.includes('access_token')) {
+    const path = window.location.pathname;
+    if (path.includes('/auth/verified') || (hash && hash.includes('access_token'))) {
       const parsedParams = new URLSearchParams(hash.substring(1));
-      const type = parsedParams.get('type');
+      const type = parsedParams.get('type') || 'signup';
       if (type === 'signup') {
         setAuthMessage("🎉 Your account has been verified successfully! Welcome to GraphLab AI.");
         setAuthMode('login');
@@ -153,14 +195,25 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, []);
 
+  // Load public data (subjects, experiments) without auth
+  const fetchPublicData = async () => {
+    try {
+      const subs = await api.getSubjects();
+      setSubjects(subs.length > 0 ? subs : ['Physics', 'Electronics', 'Electrical']);
+      const exps = await api.getExperiments();
+      setExperiments(exps.length > 0 ? exps : FALLBACK_EXPERIMENTS);
+    } catch (err) {
+      console.warn('Public data load error (using fallback experiments):', err);
+      setExperiments(FALLBACK_EXPERIMENTS);
+    }
+  };
+
   const fetchInitialUserData = async () => {
     try {
       const p = await api.getProfile();
       setProfile(p);
-      const subs = await api.getSubjects();
-      setSubjects(subs.length > 0 ? subs : ['Physics', 'Electronics', 'Electrical']);
-      const exps = await api.getExperiments();
-      setExperiments(exps);
+      // Refresh public data too
+      await fetchPublicData();
       const hist = await api.getHistory();
       setHistoryRuns(hist);
       const stats = await api.getAdminStats();
@@ -262,6 +315,27 @@ export default function App() {
     }
   };
 
+  const handleGoogleSignIn = async () => {
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({ provider: 'google' });
+      if (error) throw error;
+    } catch (err: any) {
+      setAuthError(err.message || 'Google sign-in failed');
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.resend({ type: 'signup', email: authEmail });
+      if (error) throw error;
+      setAuthMessage(`📬 Verification email resent to "${authEmail}". Please check your inbox.`);
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to resend verification email');
+    }
+  };
+
   const handleSignOut = async () => {
     await supabase.auth.signOut();
     setSession(null);
@@ -273,6 +347,8 @@ export default function App() {
   // Upload handler
   const handlePhotoUpload = async (file: File) => {
     setAuthError('');
+    setProcessingError(null);
+    setCurrentUploadFile(file);
     setViewState('processing');
     setProcessingProgress(5);
     setProcessingStep(0);
@@ -294,23 +370,32 @@ export default function App() {
       setProcessingProgress(45);
 
       if (!selectedExperimentId) {
-        // Fallback search or creation if missing
         const matched = experiments.find(e => e.name === activeExperiment);
         if (matched) setSelectedExperimentId(matched.id);
-        else return;
+        else {
+          setProcessingError('No experiment selected. Please go back and select an experiment first.');
+          return;
+        }
       }
 
       // Step 3: Checking accuracy... (Gemini OCR)
       setProcessingStep(3);
       setProcessingProgress(55);
       const ocrResult = await api.createRun(selectedExperimentId!, imageUrl);
-      setOcrConfidence(ocrResult.ocrConfidence);
-      setCurrentRunId(ocrResult.runId);
+
+      // Check for structured error from server
+      if (!ocrResult.success) {
+        setProcessingError(ocrResult.reason || 'OCR transcription failed. Try a clearer photo.');
+        return;
+      }
+
+      setOcrConfidence(ocrResult.ocrConfidence || 0.95);
+      setCurrentRunId(ocrResult.runId || null);
       setProcessingProgress(75);
       setProcessingStep(4);
 
       // Step 4: Formatting data...
-      const mappedRows = ocrResult.rows.map(r => ({
+      const mappedRows = (ocrResult.rows || []).map(r => ({
         sNo: r.index + 1,
         voltage: r.col1Value,
         current: r.col2Value,
@@ -320,14 +405,14 @@ export default function App() {
 
       setTableData(mappedRows);
       setCol1Config({
-        name: ocrResult.col1Config.name || 'X',
-        unit: ocrResult.col1Config.unit || '',
-        availableUnits: [ocrResult.col1Config.unit || '', 'V', 'mV', 'kV', 'ms', 's', 'Hz', 'kHz'].filter(Boolean)
+        name: ocrResult.col1Config?.name || 'X',
+        unit: ocrResult.col1Config?.unit || '',
+        availableUnits: [ocrResult.col1Config?.unit || '', 'V', 'mV', 'kV', 'ms', 's', 'Hz', 'kHz', 'cm', 'N', 'mm', 'min', '°C', 'Ω', 'µA', 'µW'].filter(Boolean)
       });
       setCol2Config({
-        name: ocrResult.col2Config.name || 'Y',
-        unit: ocrResult.col2Config.unit || '',
-        availableUnits: [ocrResult.col2Config.unit || '', 'mA', 'A', 'µA', 'V', 'mV'].filter(Boolean)
+        name: ocrResult.col2Config?.name || 'Y',
+        unit: ocrResult.col2Config?.unit || '',
+        availableUnits: [ocrResult.col2Config?.unit || '', 'mA', 'A', 'µA', 'V', 'mV', 's²', 'cm²', 'N', 'mm', '°C', 'Ω', 'W', 'µW'].filter(Boolean)
       });
 
       // Step 5: Almost done...
@@ -342,8 +427,63 @@ export default function App() {
       }, 600);
 
     } catch (err: any) {
-      setAuthError(err.message || 'File upload and OCR indexing failed.');
-      setViewState('upload');
+      console.error('Photo upload/OCR error:', err);
+      setProcessingError(err.message || 'File upload and OCR indexing failed. Try a clearer photo or better lighting.');
+    }
+  };
+
+  // Paste text handler — parses tab/comma-separated table data and bypasses OCR
+  const handlePastedText = (text: string) => {
+    try {
+      const lines = text.trim().split('\n').filter(l => l.trim().length > 0);
+      if (lines.length < 2) {
+        alert('Not enough data rows. Need at least a header and one data row.');
+        return;
+      }
+
+      // Detect delimiter (tab or comma)
+      const delimiter = lines[0].includes('\t') ? '\t' : ',';
+      const headerCells = lines[0].split(delimiter).map(c => c.trim());
+
+      if (headerCells.length < 2) {
+        alert('Need at least 2 columns in the table.');
+        return;
+      }
+
+      const rows: DataRow[] = [];
+      for (let i = 1; i < lines.length; i++) {
+        const cells = lines[i].split(delimiter).map(c => c.trim());
+        const val1 = parseFloat(cells[0]) || 0;
+        const val2 = parseFloat(cells[1]) || 0;
+        rows.push({
+          sNo: i,
+          voltage: val1,
+          current: val2,
+        });
+      }
+
+      if (rows.length === 0) {
+        alert('Could not parse any numeric data from the pasted text.');
+        return;
+      }
+
+      setTableData(rows);
+      setCol1Config({
+        name: headerCells[0] || 'Column 1',
+        unit: '',
+        availableUnits: ['V', 'mV', 'kV', 'ms', 's', 'Hz', 'kHz', 'cm', 'N', 'mm', 'min', '°C', 'Ω']
+      });
+      setCol2Config({
+        name: headerCells[1] || 'Column 2',
+        unit: '',
+        availableUnits: ['mA', 'A', 'µA', 'V', 'mV', 's²', 'cm²', 'N', 'mm', '°C', 'Ω', 'W']
+      });
+
+      // Skip upload/processing and go straight to editor
+      setViewState('editor');
+    } catch (err) {
+      console.error('Paste text parse error:', err);
+      alert('Failed to parse the pasted text. Make sure it is a properly formatted table.');
     }
   };
 
@@ -371,22 +511,31 @@ export default function App() {
     }
   };
 
-  // Caching fetches
+  // Caching fetches (theory and viva are now public)
   useEffect(() => {
-    if (session && selectedExperimentId && viewState === 'theory') {
+    if (selectedExperimentId && viewState === 'theory') {
       api.getTheory(selectedExperimentId)
         .then(t => setCachedTheory(t))
         .catch(console.error);
     }
-  }, [viewState, selectedExperimentId, session]);
+  }, [viewState, selectedExperimentId]);
 
   useEffect(() => {
-    if (session && selectedExperimentId && viewState === 'explanation') {
+    if (selectedExperimentId && viewState === 'explanation') {
       api.getViva(selectedExperimentId)
         .then(v => setCachedViva(v))
         .catch(console.error);
     }
-  }, [viewState, selectedExperimentId, session]);
+  }, [viewState, selectedExperimentId]);
+
+  // Fetch experiment detail when experiment is selected
+  useEffect(() => {
+    if (selectedExperimentId) {
+      api.getExperiment(selectedExperimentId)
+        .then(detail => setCurrentExperimentDetail(detail))
+        .catch(console.error);
+    }
+  }, [selectedExperimentId]);
 
   // Fallback frontend calculations in case backend hasn't generated calculations yet
   const regression = useMemo(() => {
@@ -417,6 +566,42 @@ export default function App() {
     const resistance = slope !== 0 ? factor / slope : 100.0;
     return { slope, intercept, resistance };
   }, [tableData, col1Config, col2Config, graphResult]);
+
+  const aiExplanationText = useMemo(() => {
+    if (graphResult?.calculationText) {
+      return `For the experiment "${activeExperiment}", the analysis was processed dynamically. We determined a slope of ${regression.slope.toFixed(4)} and an intercept of ${regression.intercept.toFixed(4)} with a goodness-of-fit R² value of ${graphResult.rSquared?.toFixed(4) || '1.00'}.\n\nDetailed calculation breakdown:\n${graphResult.calculationText}`;
+    }
+    return `Your graph is plotted for "${activeExperiment}". The slope of the line is approximately ${regression.slope.toFixed(2)} ${col2Config.unit}/${col1Config.unit}, with a Y-intercept of ${regression.intercept.toFixed(2)}. This represents the physical relationship between ${col2Config.name} and ${col1Config.name}.`;
+  }, [activeExperiment, regression, col1Config, col2Config, graphResult]);
+
+  const commonMistakesList = useMemo(() => {
+    if (activeExperiment === "Ohm's Law") {
+      return [
+        "Incorrect scale selection (doesn't occupy 60% of graph space)",
+        "Wrong axis connection (swapping independent and dependent variables)",
+        "Parallax error when reading analog voltmeter and ammeter scales",
+        "Not taking zero reading (forgetting that 0V must output 0A)"
+      ];
+    } else if (activeExperiment === "RC Circuit Response") {
+      return [
+        "Not waiting long enough for the capacitor to fully charge",
+        "Using wrong resistor values which shifts the charging rate beyond display range",
+        "Forgetting to completely discharge capacitor before starting a new run"
+      ];
+    } else if (activeExperiment === "Simple Pendulum") {
+      return [
+        "Incorrect measurement of pendulum length (failing to measure to the center of the bob)",
+        "Releasing the pendulum at too large an angle (>10 degrees), causing non-harmonic motion",
+        "Reaction time errors in stopwatch start/stop triggers"
+      ];
+    }
+    return [
+      "Incorrect scale selection (doesn't occupy 60% of graph space)",
+      "Swapping the independent and dependent variables on axes",
+      "Using insufficient data points to trace curves or peaks",
+      "Parallax or reading resolution errors on instrument display scale values"
+    ];
+  }, [activeExperiment]);
 
   const toggleFavorite = (expName: string) => {
     setFavorites(prev => ({ ...prev, [expName]: !prev[expName] }));
@@ -644,6 +829,22 @@ export default function App() {
                       <button type="submit" className="w-full bg-ink-primary text-white font-heading font-black py-2.5 rounded-lg border-2 border-ink-primary shadow-[2px_2px_0px_0px_rgba(243,156,18,1)] hover:translate-y-[1px] hover:shadow-[1px_1px_0px_0px_rgba(243,156,18,1)] transition-all cursor-pointer text-center uppercase tracking-wider">
                         Access Lab Book
                       </button>
+
+                      <div className="relative my-4 flex items-center justify-center">
+                        <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-ink-primary/10"></div></div>
+                        <span className="relative bg-white px-3 text-[10px] uppercase font-bold text-ink-secondary">Or connect with</span>
+                      </div>
+
+                      <button type="button" onClick={handleGoogleSignIn} className="w-full flex items-center justify-center gap-2 bg-white text-ink-primary font-heading font-semibold py-2.5 rounded-lg border-2 border-ink-primary hover:bg-ink-primary/5 transition-all cursor-pointer text-xs uppercase tracking-wider shadow-[2px_2px_0px_0px_rgba(44,62,80,0.15)]">
+                        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                          <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                          <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" fill="#FBBC05"/>
+                          <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" fill="#EA4335"/>
+                        </svg>
+                        Continue with Google
+                      </button>
+
                       <div className="flex justify-between items-center text-[10px] text-ink-secondary font-bold pt-2">
                         <button type="button" onClick={() => setAuthMode('signup')} className="hover:text-accent-orange underline">Create Account</button>
                         <button type="button" onClick={() => setAuthMode('forgot')} className="hover:text-accent-orange underline">Forgot Password?</button>
@@ -690,6 +891,22 @@ export default function App() {
                       <button type="submit" className="w-full bg-ink-primary text-white font-heading font-black py-2.5 rounded-lg border-2 border-ink-primary shadow-[2px_2px_0px_0px_rgba(243,156,18,1)] hover:translate-y-[1px] hover:shadow-[1px_1px_0px_0px_rgba(243,156,18,1)] transition-all cursor-pointer text-center uppercase tracking-wider">
                         Register Student
                       </button>
+
+                      <div className="relative my-4 flex items-center justify-center">
+                        <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-ink-primary/10"></div></div>
+                        <span className="relative bg-white px-3 text-[10px] uppercase font-bold text-ink-secondary">Or connect with</span>
+                      </div>
+
+                      <button type="button" onClick={handleGoogleSignIn} className="w-full flex items-center justify-center gap-2 bg-white text-ink-primary font-heading font-semibold py-2.5 rounded-lg border-2 border-ink-primary hover:bg-ink-primary/5 transition-all cursor-pointer text-xs uppercase tracking-wider shadow-[2px_2px_0px_0px_rgba(44,62,80,0.15)]">
+                        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                          <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                          <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" fill="#FBBC05"/>
+                          <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" fill="#EA4335"/>
+                        </svg>
+                        Continue with Google
+                      </button>
+
                       <div className="text-center text-[10px] text-ink-secondary font-bold pt-2">
                         Already have a lab session? <button type="button" onClick={() => setAuthMode('login')} className="hover:text-accent-orange underline">Login here</button>
                       </div>
@@ -750,7 +967,10 @@ export default function App() {
                       <p className="text-xs font-semibold text-ink-secondary leading-relaxed">
                         Check your inbox for a verification email. Click the verification link to activate your student session, then reload this page to log in.
                       </p>
-                      <button onClick={() => setAuthMode('login')} className="w-full bg-ink-primary text-white font-heading font-black py-2.5 rounded-lg border-2 border-ink-primary shadow-[2px_2px_0px_0px_rgba(243,156,18,1)] hover:translate-y-[1px] hover:shadow-[1px_1px_0px_0px_rgba(243,156,18,1)] transition-all cursor-pointer text-center uppercase tracking-wider">
+                      <button onClick={handleResendVerification} className="w-full bg-accent-orange text-white font-heading font-black py-2.5 rounded-lg border border-ink-primary shadow-[2px_2px_0px_0px_rgba(44,62,80,1)] hover:translate-y-[1px] hover:shadow-[1px_1px_0px_0px_rgba(44,62,80,1)] transition-all cursor-pointer text-center uppercase tracking-wider">
+                        Resend Verification Email
+                      </button>
+                      <button onClick={() => setAuthMode('login')} className="w-full bg-ink-primary text-white font-heading font-black py-2.5 rounded-lg border-2 border-ink-primary shadow-[2px_2px_0px_0px_rgba(243,156,18,1)] hover:translate-y-[1px] hover:shadow-[1px_1px_0px_0px_rgba(243,156,18,1)] transition-all cursor-pointer text-center uppercase tracking-wider mt-2">
                         Back to Login
                       </button>
                     </div>
@@ -948,7 +1168,7 @@ export default function App() {
                         </button>
                       ))}
                       {filteredExperiments.length === 0 && (
-                        <div className="text-ink-secondary py-3 text-center">No experiments found. Try checking database seeds.</div>
+                        <div className="text-ink-secondary py-3 text-center">No experiments match your search. Try a different keyword.</div>
                       )}
                     </div>
                   </div>
@@ -973,34 +1193,37 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="bg-[#FDF8EC] p-4 rounded-xl border-2 border-ink-primary shadow-[2px_2px_0px_0px_rgba(44,62,80,1)] relative overflow-hidden flex flex-col justify-between">
-                      <button 
-                        onClick={() => toggleFavorite("Ohm's Law")} 
-                        className="absolute top-1.5 right-2 cursor-pointer hover:scale-110 transition-transform"
-                      >
-                        <Star className={`w-4 h-4 ${favorites["Ohm's Law"] ? 'fill-star-gold text-star-gold' : 'text-ink-secondary'}`} />
-                      </button>
-                      <div>
-                        <span className="text-[9px] font-bold text-accent-orange uppercase tracking-wider">Recommended Standard</span>
-                        <h4 className="text-xs font-bold font-heading text-ink-primary mt-1 mb-2">Verify Ohm's Law</h4>
-                        <p className="text-[10px] text-ink-secondary leading-relaxed">
-                          Analyze the linear relationship between voltage and current values to calculate resistance.
-                        </p>
-                      </div>
-                      <button 
-                        onClick={() => {
-                          const ohms = experiments.find(e => e.name === "Ohm's Law");
-                          if (ohms) {
-                            setActiveExperiment(ohms.name);
-                            setSelectedExperimentId(ohms.id);
-                            setViewState('upload');
-                          }
-                        }}
-                        className="mt-4 text-[10px] font-bold text-accent-blue hover:underline text-left cursor-pointer"
-                      >
-                        Start Ohm's Law Analysis →
-                      </button>
-                    </div>
+                    {(() => {
+                      const recommended = filteredExperiments[0];
+                      if (!recommended) return null;
+                      return (
+                        <div className="bg-[#FDF8EC] p-4 rounded-xl border-2 border-ink-primary shadow-[2px_2px_0px_0px_rgba(44,62,80,1)] relative overflow-hidden flex flex-col justify-between">
+                          <button 
+                            onClick={() => toggleFavorite(recommended.name)} 
+                            className="absolute top-1.5 right-2 cursor-pointer hover:scale-110 transition-transform"
+                          >
+                            <Star className={`w-4 h-4 ${favorites[recommended.name] ? 'fill-star-gold text-star-gold' : 'text-ink-secondary'}`} />
+                          </button>
+                          <div>
+                            <span className="text-[9px] font-bold text-accent-orange uppercase tracking-wider">Recommended for {activeSubject}</span>
+                            <h4 className="text-xs font-bold font-heading text-ink-primary mt-1 mb-2">{recommended.name}</h4>
+                            <p className="text-[10px] text-ink-secondary leading-relaxed">
+                              {recommended.aim}
+                            </p>
+                          </div>
+                          <button 
+                            onClick={() => {
+                              setActiveExperiment(recommended.name);
+                              setSelectedExperimentId(recommended.id);
+                              setViewState('upload');
+                            }}
+                            className="mt-4 text-[10px] font-bold text-accent-blue hover:underline text-left cursor-pointer"
+                          >
+                            Start {recommended.name} Analysis →
+                          </button>
+                        </div>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>
@@ -1019,7 +1242,7 @@ export default function App() {
                   <p className="text-xs text-ink-secondary mt-1">Upload a snapshot of your written or printed lab recordings</p>
                 </div>
 
-                <UploadDropzone onUploadStart={() => {}} onUpload={handlePhotoUpload} />
+                <UploadDropzone onUploadStart={() => {}} onUpload={handlePhotoUpload} onPasteText={handlePastedText} />
               </div>
             </NotebookPage>
           )}
@@ -1027,10 +1250,23 @@ export default function App() {
           {viewState === 'processing' && (
             <NotebookPage tabLabel="AI Processing Table" showDecorations={true}>
               <div className="flex flex-col items-center justify-center text-center py-12 max-w-sm mx-auto">
-                <RobotMascot expression="thinking" className="w-24 h-24 mb-6" />
-                <h2 className="text-lg font-bold font-heading text-ink-primary mb-2">Analyzing Lab Notebook Table</h2>
-                <p className="text-xs text-ink-secondary mb-8">Reading handwritten notations, scaling, and transcribing metrics</p>
-                <AIProcessingChecklist currentStep={processingStep} progress={processingProgress} />
+                <RobotMascot expression={processingError ? "normal" : "thinking"} className="w-24 h-24 mb-6" />
+                <h2 className="text-lg font-bold font-heading text-ink-primary mb-2">{processingError ? 'Processing Issue' : 'Analyzing Lab Notebook Table'}</h2>
+                <p className="text-xs text-ink-secondary mb-8">{processingError ? 'We ran into a problem reading your data' : 'Reading handwritten notations, scaling, and transcribing metrics'}</p>
+                <AIProcessingChecklist 
+                  currentStep={processingStep} 
+                  progress={processingProgress}
+                  errorMessage={processingError}
+                  onRetry={() => {
+                    if (currentUploadFile) {
+                      handlePhotoUpload(currentUploadFile);
+                    }
+                  }}
+                  onReupload={() => {
+                    setProcessingError(null);
+                    setViewState('upload');
+                  }}
+                />
               </div>
             </NotebookPage>
           )}
@@ -1173,6 +1409,10 @@ export default function App() {
                         col1Config={col1Config}
                         col2Config={col2Config}
                         zoomLevel={graphZoom}
+                        xTransform={currentExperimentDetail?.xTransform}
+                        yTransform={currentExperimentDetail?.yTransform}
+                        xAxisLabel={graphResult?.xAxisLabelText || currentExperimentDetail?.xAxisLabel || undefined}
+                        yAxisLabel={graphResult?.yAxisLabelText || currentExperimentDetail?.yAxisLabel || undefined}
                       />
                     </div>
                   </div>
@@ -1191,10 +1431,29 @@ export default function App() {
                           <div className="text-[10px] text-ink-secondary uppercase tracking-widest">Y-Intercept (c)</div>
                           <div className="text-lg font-bold font-heading mt-0.5">{regression.intercept.toFixed(4)}</div>
                         </div>
-                        <div>
-                          <div className="text-[10px] text-ink-secondary uppercase tracking-widest">Calculated Resistance (R)</div>
-                          <div className="text-lg font-bold font-heading text-accent-red-orange mt-0.5">{regression.resistance.toFixed(1)} Ω</div>
-                        </div>
+                        {activeExperiment === "Ohm's Law" ? (
+                          <div>
+                            <div className="text-[10px] text-ink-secondary uppercase tracking-widest">Calculated Resistance (R)</div>
+                            <div className="text-lg font-bold font-heading text-accent-red-orange mt-0.5">{regression.resistance.toFixed(1)} Ω</div>
+                          </div>
+                        ) : activeExperiment === "Simple Pendulum" ? (
+                          <div>
+                            <div className="text-[10px] text-ink-secondary uppercase tracking-widest">Acceleration due to Gravity (g)</div>
+                            <div className="text-lg font-bold font-heading text-accent-red-orange mt-0.5">
+                              {regression.slope !== 0 ? ((4 * Math.PI * Math.PI) / (regression.slope / 100)).toFixed(2) : '9.80'} m/s²
+                            </div>
+                          </div>
+                        ) : activeExperiment === "Stefan's Law" ? (
+                          <div>
+                            <div className="text-[10px] text-ink-secondary uppercase tracking-widest">Stefan's Exponent (Expected: 4)</div>
+                            <div className="text-lg font-bold font-heading text-accent-red-orange mt-0.5">{regression.slope.toFixed(2)}</div>
+                          </div>
+                        ) : currentExperimentDetail?.formula ? (
+                          <div>
+                            <div className="text-[10px] text-ink-secondary uppercase tracking-widest">Derived Relation</div>
+                            <div className="text-sm font-bold font-heading text-accent-red-orange mt-0.5">{currentExperimentDetail.formula}</div>
+                          </div>
+                        ) : null}
                       </div>
                     </div>
 
@@ -1247,10 +1506,10 @@ export default function App() {
                   data={tableData} 
                   col1Config={col1Config}
                   col2Config={col2Config}
-                  formula={activeExperiment === "Ohm's Law" ? "V = IR" : activeExperiment === "RC Circuit Response" ? "τ = RC" : activeExperiment === "LCR Circuit Response" ? "f_r = 1 / (2π × √(L × C))" : "V = IR"}
+                  formula={currentExperimentDetail?.formula || "y = mx + c"}
                   scaleX={graphResult?.suggestedScale?.split(',')[0] || `1 cm = ${(Math.max(...tableData.map(d => d.voltage), 5) / 5).toFixed(1)} ${col1Config.unit}`}
                   scaleY={graphResult?.suggestedScale?.split(',')[1] || `1 cm = ${(Math.max(...tableData.map(d => d.current), 50) / 5).toFixed(0)} ${col2Config.unit}`}
-                  expectedOutcome={activeExperiment === "Ohm's Law" ? "A straight line passing through the origin, representing direct proportionality." : activeExperiment === "RC Circuit Response" ? "An exponential curve asymptotically approaching the maximum input voltage." : activeExperiment === "LCR Circuit Response" ? "A bell-shaped resonance curve with a distinct peak current value." : "A linear relationship."}
+                  expectedOutcome={currentExperimentDetail?.aim || "A linear or expected physical relationship."}
                 />
 
               </div>
@@ -1296,133 +1555,24 @@ export default function App() {
                   <div className="flex-1 bg-white border-2 border-ink-primary rounded-xl shadow-[3px_3px_0px_0px_rgba(44,62,80,1)] p-6 relative overflow-hidden font-body text-xs text-ink-primary leading-relaxed min-h-[300px]">
                     <div className="absolute top-[-5px] left-4 w-10 h-3 bg-accent-blue/20 rotate-3"></div>
                     
-                    {theorySection === 'Formula' ? (
+                    {theorySection === 'Aim' ? (
                       <div>
                         <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
-                          {activeExperiment} Formula
+                          Aim
                         </h3>
-                        
-                        {/* Big Formula Box */}
-                        <div className="my-6 flex justify-center py-4 bg-paper-card rounded-xl border border-ink-primary/10">
-                          <span className="text-3xl md:text-4xl font-handwritten font-bold text-ink-primary tracking-wide animate-none">
-                            {activeExperiment === "Ohm's Law" ? "V = IR" : activeExperiment === "RC Circuit Response" ? "τ = R × C" : activeExperiment === "LCR Circuit Response" ? "f_r = 1 / (2π × √(L × C))" : "V = IR"}
-                          </span>
-                        </div>
-
-                        {/* Variables legend */}
-                        {activeExperiment === "Ohm's Law" ? (
-                          <div className="space-y-2 mt-4 pl-1 font-semibold text-xs text-ink-primary">
-                            <div><span className="font-mono text-accent-red-orange text-sm font-bold">V</span> = Voltage (V) - Measured in Volts</div>
-                            <div><span className="font-mono text-accent-blue text-sm font-bold">I</span> = Current (A) - Measured in Amperes (transcribed as mA in table)</div>
-                            <div><span className="font-mono text-success-green text-sm font-bold">R</span> = Resistance (Ω) - Measured in Ohms</div>
-                          </div>
-                        ) : activeExperiment === "RC Circuit Response" ? (
-                          <div className="space-y-2 mt-4 pl-1 font-semibold text-xs text-ink-primary">
-                            <div><span className="font-mono text-accent-red-orange text-sm font-bold">τ</span> = Time Constant (s) - Time to charge to 63.2%</div>
-                            <div><span className="font-mono text-accent-blue text-sm font-bold">R</span> = Resistance (Ω) - Series resistors value</div>
-                            <div><span className="font-mono text-success-green text-sm font-bold">C</span> = Capacitance (F) - Capacitor capacity in Farads</div>
-                          </div>
-                        ) : (
-                          <div className="space-y-2 mt-4 pl-1 font-semibold text-xs text-ink-primary">
-                            <div><span className="font-mono text-accent-red-orange text-sm font-bold">f_r</span> = Resonant Frequency (Hz) - Peak frequency of current</div>
-                            <div><span className="font-mono text-accent-blue text-sm font-bold">L</span> = Inductance (H) - Inductor coil capacity</div>
-                            <div><span className="font-mono text-success-green text-sm font-bold">C</span> = Capacitance (F) - Capacitor capacity in Farads</div>
-                          </div>
-                        )}
-
-                        {/* Handdrawn circuit diagram */}
-                        <div className="mt-8 border-t border-ink-primary/10 pt-4 flex flex-col items-center">
-                          <span className="text-[10px] font-bold text-ink-secondary mb-2 uppercase tracking-wide">Circuit Diagram Doodle</span>
-                          <svg viewBox="0 0 160 90" className="w-40 h-24 stroke-ink-primary" fill="none" strokeWidth="1.5">
-                            <path d="M 10 45 L 50 45 M 110 45 L 150 45 M 10 45 L 10 10 L 150 10 L 150 45 M 10 45 L 10 80 L 150 80 L 150 45" />
-                            {activeExperiment === "LCR Circuit Response" ? (
-                              <circle cx="80" cy="10" r="6" />
-                            ) : (
-                              <>
-                                <line x1="70" y1="5" x2="70" y2="15" strokeWidth="2.5" />
-                                <line x1="80" y1="8" x2="80" y2="12" />
-                                <line x1="90" y1="5" x2="90" y2="15" strokeWidth="2.5" />
-                              </>
-                            )}
-                            {activeExperiment === "LCR Circuit Response" ? (
-                              <>
-                                <path d="M 60 80 L 65 75 L 75 85 L 85 75 L 90 80" />
-                                <path d="M 90 80 Q 95 72 100 80 Q 105 72 110 80" />
-                              </>
-                            ) : (
-                              <path d="M 60 80 L 65 75 L 75 85 L 85 75 L 95 85 L 100 80" />
-                            )}
-                            {activeExperiment === "RC Circuit Response" ? (
-                              <>
-                                <line x1="77" y1="35" x2="77" y2="55" strokeWidth="2.5" />
-                                <line x1="83" y1="35" x2="83" y2="55" strokeWidth="2.5" />
-                              </>
-                            ) : (
-                              <>
-                                <circle cx="80" cy="45" r="12" fill="white" />
-                                <text x="80" y="49" textAnchor="middle" stroke="none" fill="var(--color-ink-primary)" className="font-heading font-bold text-[10px]">{activeExperiment === "LCR Circuit Response" ? "A" : "V"}</text>
-                              </>
-                            )}
-                          </svg>
-                        </div>
+                        <p className="font-semibold text-ink-primary leading-relaxed whitespace-pre-line">
+                          {currentExperimentDetail?.aim || 'To study and verify physical/electronic relationships.'}
+                        </p>
                       </div>
-                    ) : theorySection === 'Calculation' ? (
-                      <div>
-                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide animate-none">
-                          Worked Calculation
-                        </h3>
-
-                        <div className="bg-paper-card border border-ink-primary/10 rounded-xl p-4 mb-4">
-                          <div className="text-[10px] font-bold text-ink-secondary uppercase tracking-wider mb-2">Mathematical Model</div>
-                          {activeExperiment === "Ohm's Law" ? (
-                            <div className="space-y-2">
-                              <div className="font-handwritten text-xl font-bold text-ink-primary">R = 1 / Slope</div>
-                              <div className="text-xs text-ink-secondary">Where Slope (m) = Δ{col2Config.name} / Δ{col1Config.name}</div>
-                            </div>
-                          ) : activeExperiment === "RC Circuit Response" ? (
-                            <div className="space-y-2">
-                              <div className="font-handwritten text-xl font-bold text-ink-primary">τ = R × C</div>
-                              <div className="text-xs text-ink-secondary">Determined by finding t when V(t) = 0.632 × V_max</div>
-                            </div>
-                          ) : (
-                            <div className="space-y-2">
-                              <div className="font-handwritten text-xl font-bold text-ink-primary">f_r = 1 / (2π × √(L × C))</div>
-                              <div className="text-xs text-ink-secondary">Determined by identifying the frequency of peak current</div>
-                            </div>
-                          )}
-                        </div>
-
-                        <div className="bg-[#FDF8EC] border-2 border-dashed border-ink-primary/20 rounded-xl p-4 mb-4">
-                          <div className="text-[10px] font-bold text-accent-orange uppercase tracking-wider mb-3">Worked Step-by-Step</div>
-                          
-                          <pre className="whitespace-pre-line font-mono text-[11px] leading-relaxed text-ink-primary">
-                            {graphResult?.calculationText || `Calculating regression values based on current table data...`}
-                          </pre>
-                        </div>
-
-                        <div className="bg-success-green/5 border-2 border-success-green/30 rounded-xl p-4">
-                          <div className="text-[10px] font-bold text-success-green uppercase tracking-wider mb-1">Final Result Summary</div>
-                          <div className="text-xs font-bold text-ink-primary leading-normal">
-                            {activeExperiment === "Ohm's Law" ? (
-                              <span>Calculated Resistance (R) is <span className="font-mono text-sm text-success-green">{regression.resistance.toFixed(1)} Ω</span></span>
-                            ) : activeExperiment === "RC Circuit Response" ? (
-                              <span>Time Constant (τ) is <span className="font-mono text-sm text-success-green">{(regression.slope !== 0 ? Math.abs(1.5 / regression.slope) : 2.5).toFixed(2)} ms</span></span>
-                            ) : (
-                              <span>Resonant Frequency (f_r) is <span className="font-mono text-sm text-success-green">{(regression.slope !== 0 ? Math.abs(8.2 * regression.slope) : 1000).toFixed(0)} Hz</span></span>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
+                    ) : theorySection === 'Theory' ? (
                       <div>
                         <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
-                          {theorySection}
+                          Theory
                         </h3>
-                        
                         <div className="mb-5">
                           <span className="text-[10px] font-bold text-ink-secondary uppercase tracking-wider block mb-1.5">Formal Theory (Textbook)</span>
                           <p className="font-medium bg-paper-bg/10 p-3 rounded-lg border border-ink-primary/5 whitespace-pre-line text-ink-primary">
-                            {cachedTheory?.formal || `Refer to the experiment handout instructions for detailed information on ${activeExperiment}.`}
+                            {cachedTheory?.formal || currentExperimentDetail?.theoryFormal || `Refer to the experiment handout instructions for detailed information on ${activeExperiment}.`}
                           </p>
                         </div>
 
@@ -1440,12 +1590,166 @@ export default function App() {
                             <div className="flex-1">
                               <h4 className="text-xs font-bold text-accent-blue uppercase tracking-wide mb-1 font-heading">In Plain Terms</h4>
                               <p className="text-xs font-semibold text-ink-primary leading-relaxed whitespace-pre-line">
-                                {cachedTheory?.simple || `Analogy calculations generated by Gemini Vision models on startup.`}
+                                {cachedTheory?.simple || currentExperimentDetail?.theorySimple || `Simplified explanation will be generated dynamically on demand.`}
                               </p>
                             </div>
                           </div>
                         </div>
+                      </div>
+                    ) : theorySection === 'Formula' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          {activeExperiment} Formula
+                        </h3>
+                        
+                        {/* Big Formula Box */}
+                        <div className="my-6 flex justify-center py-4 bg-paper-card rounded-xl border border-ink-primary/10">
+                          <span className="text-3xl md:text-4xl font-handwritten font-bold text-ink-primary tracking-wide animate-none">
+                            {currentExperimentDetail?.formula || 'y = mx + c'}
+                          </span>
+                        </div>
 
+                        {/* Variables legend */}
+                        <div className="space-y-2 mt-4 pl-1 font-semibold text-xs text-ink-primary">
+                          <div><span className="font-bold text-accent-orange">Experiment Name:</span> {activeExperiment}</div>
+                          <div><span className="font-bold text-accent-blue">Subject Category:</span> {currentExperimentDetail?.subject}</div>
+                          <div><span className="font-bold text-success-green">Primary Equation:</span> {currentExperimentDetail?.formula || 'N/A'}</div>
+                        </div>
+
+                        {/* Handdrawn circuit diagram for electronics/electrical */}
+                        {(activeExperiment.includes("Law") || activeExperiment.includes("Diode") || activeExperiment.includes("Circuit") || activeExperiment.includes("Bridge")) && (
+                          <div className="mt-8 border-t border-ink-primary/10 pt-4 flex flex-col items-center">
+                            <span className="text-[10px] font-bold text-ink-secondary mb-2 uppercase tracking-wide">Circuit Diagram Sketch</span>
+                            <svg viewBox="0 0 160 90" className="w-40 h-24 stroke-ink-primary" fill="none" strokeWidth="1.5">
+                              <path d="M 10 45 L 50 45 M 110 45 L 150 45 M 10 45 L 10 10 L 150 10 L 150 45 M 10 45 L 10 80 L 150 80 L 150 45" />
+                              <line x1="70" y1="5" x2="70" y2="15" strokeWidth="2.5" />
+                              <line x1="80" y1="8" x2="80" y2="12" />
+                              <line x1="90" y1="5" x2="90" y2="15" strokeWidth="2.5" />
+                              <path d="M 60 80 L 65 75 L 75 85 L 85 75 L 95 85 L 100 80" />
+                              <circle cx="80" cy="45" r="12" fill="white" />
+                              <text x="80" y="49" textAnchor="middle" stroke="none" fill="var(--color-ink-primary)" className="font-heading font-bold text-[10px]">V</text>
+                            </svg>
+                          </div>
+                        )}
+                      </div>
+                    ) : theorySection === 'Procedure' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          Procedure Instructions
+                        </h3>
+                        <p className="font-semibold text-ink-primary leading-relaxed whitespace-pre-line bg-paper-bg/10 p-3 rounded-lg border border-ink-primary/5">
+                          {currentExperimentDetail?.procedure || 'Handout instructions are currently loading or unavailable.'}
+                        </p>
+                      </div>
+                    ) : theorySection === 'Observation' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          Observations Data
+                        </h3>
+                        <p className="font-semibold text-ink-primary mb-4">
+                          Total readings recorded: {tableData.length}
+                        </p>
+                        <div className="overflow-x-auto border border-ink-primary/10 rounded-lg">
+                          <table className="w-full text-left font-body text-xs">
+                            <thead className="bg-paper-bg/40 font-bold">
+                              <tr>
+                                <th className="p-2 border-b border-r border-ink-primary/10 w-16 text-center">S.No.</th>
+                                <th className="p-2 border-b border-r border-ink-primary/10">{col1Config.name} ({col1Config.unit})</th>
+                                <th className="p-2 border-b border-ink-primary/10">{col2Config.name} ({col2Config.unit})</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-ink-primary/5 font-mono">
+                              {tableData.map((d) => (
+                                <tr key={d.sNo}>
+                                  <td className="p-2 border-r border-ink-primary/10 text-center font-bold bg-paper-bg/25">{d.sNo}</td>
+                                  <td className="p-2 border-r border-ink-primary/10">{d.voltage}</td>
+                                  <td className="p-2">{d.current}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ) : theorySection === 'Precautions' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          Precautions & Source of Error
+                        </h3>
+                        <p className="font-semibold text-ink-primary leading-relaxed whitespace-pre-line bg-paper-bg/10 p-3 rounded-lg border border-ink-primary/5">
+                          {currentExperimentDetail?.precautions || 'Ensure proper calibration and double check all analog dial connections.'}
+                        </p>
+                      </div>
+                    ) : theorySection === 'Applications' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          Applications & Real-World Use
+                        </h3>
+                        <p className="font-semibold text-ink-primary leading-relaxed whitespace-pre-line bg-paper-bg/10 p-3 rounded-lg border border-ink-primary/5">
+                          {currentExperimentDetail?.applications || 'Used in standard material analysis and basic scientific engineering models.'}
+                        </p>
+                      </div>
+                    ) : theorySection === 'Calculation' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide animate-none">
+                          Worked Calculation
+                        </h3>
+
+                        <div className="bg-paper-card border border-ink-primary/10 rounded-xl p-4 mb-4">
+                          <div className="text-[10px] font-bold text-ink-secondary uppercase tracking-wider mb-2">Mathematical Model</div>
+                          <div className="space-y-2">
+                            <div className="font-handwritten text-xl font-bold text-ink-primary">
+                              {currentExperimentDetail?.formula || 'y = mx + c'}
+                            </div>
+                            <div className="text-xs text-ink-secondary">
+                              Slope (m) = Δ({col2Config.name}) / Δ({col1Config.name}) = {regression.slope.toFixed(4)}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="bg-[#FDF8EC] border-2 border-dashed border-ink-primary/20 rounded-xl p-4 mb-4">
+                          <div className="text-[10px] font-bold text-accent-orange uppercase tracking-wider mb-3">Worked Step-by-Step</div>
+                          
+                          <pre className="whitespace-pre-line font-mono text-[11px] leading-relaxed text-ink-primary">
+                            {graphResult?.calculationText || `Calculating regression values based on current table data...`}
+                          </pre>
+                        </div>
+
+                        <div className="bg-success-green/5 border-2 border-success-green/30 rounded-xl p-4">
+                          <div className="text-[10px] font-bold text-success-green uppercase tracking-wider mb-1">Final Result Summary</div>
+                          <div className="text-xs font-bold text-ink-primary leading-normal">
+                            Slope (m) = <span className="font-mono text-sm text-success-green">{regression.slope.toFixed(4)}</span>, Y-intercept (c) = <span className="font-mono text-sm text-success-green">{regression.intercept.toFixed(4)}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ) : theorySection === 'Result' ? (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          Experimental Result
+                        </h3>
+                        <div className="bg-success-green/5 border-2 border-success-green/30 rounded-xl p-4 whitespace-pre-line font-mono text-xs">
+                          {graphResult?.calculationText?.split('\n').filter(line => line.toLowerCase().includes('result') || line.toLowerCase().includes('verify') || line.toLowerCase().includes('calculate') || line.toLowerCase().includes('step')).join('\n') || 
+                           `Measured slope = ${regression.slope.toFixed(4)}\nY-intercept = ${regression.intercept.toFixed(4)}`}
+                        </div>
+                      </div>
+                    ) : (
+                      <div>
+                        <h3 className="text-sm font-bold font-heading text-ink-primary border-b border-ink-primary/10 pb-1.5 mb-4 uppercase tracking-wide">
+                          Viva Questions Bank
+                        </h3>
+                        <div className="space-y-4 font-semibold text-xs text-ink-primary">
+                          {cachedViva.map((q) => (
+                            <div key={q.id} className="border-b border-dashed border-ink-primary/10 pb-3">
+                              <div className="text-[9px] text-accent-orange uppercase tracking-wider mb-1 font-mono">{q.category} Question</div>
+                              <div className="font-bold mb-1.5 text-ink-primary">Q: {q.question}</div>
+                              <div className="text-ink-secondary bg-paper-bg/30 p-2.5 rounded border border-ink-primary/5 font-medium leading-relaxed">
+                                <span className="font-bold text-success-green mr-1">Answer:</span> {q.answer}
+                              </div>
+                            </div>
+                          ))}
+                          {cachedViva.length === 0 && (
+                            <div className="text-ink-secondary py-3 text-center">No cached viva questions available. Click AI Explanation tab to fetch/generate.</div>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1489,30 +1793,8 @@ export default function App() {
 
                 <AIExplanationBubble
                   title="Graph Verification Results"
-                  bubbleText={activeExperiment === "Ohm's Law" 
-                    ? `Your graph is a straight line passing through the origin, which shows that ${col2Config.name.toLowerCase()} is directly proportional to ${col1Config.name.toLowerCase()}. This verifies Ohm's Law. The slope of the line is approximately ${regression.slope.toFixed(2)} ${col2Config.unit}/${col1Config.unit}, giving a calculated resistance of R = ${regression.resistance.toFixed(1)} Ω.`
-                    : activeExperiment === "RC Circuit Response"
-                    ? `Your graph shows an exponential charging curve for the capacitor. The voltage rises rapidly at first, then flattens out as it approaches the maximum input voltage. From the 63.2% mark on the curve, the time constant τ of the circuit is calculated to be approximately ${(regression.slope !== 0 ? Math.abs(1.5 / regression.slope) : 2.5).toFixed(2)} ms.`
-                    : `Your graph exhibits a distinct resonance peak where current reaches its maximum value. This represents the resonant frequency of the series LCR circuit, where inductive and capacitive reactances cancel out. The resonant frequency is calculated to be approximately ${(regression.slope !== 0 ? Math.abs(8.2 * regression.slope) : 1000).toFixed(0)} Hz.`
-                  }
-                  commonMistakes={activeExperiment === "Ohm's Law"
-                    ? [
-                        "Incorrect scale selection (doesn't occupy 60% of graph space)",
-                        "Wrong axis connection (swapping independent and dependent variables)",
-                        "Parallax error when reading analog voltmeter and ammeter scales",
-                        "Not taking zero reading (forgetting that 0V must output 0A)"
-                      ]
-                    : activeExperiment === "RC Circuit Response"
-                    ? [
-                        "Not waiting long enough for the capacitor to fully charge",
-                        "Using wrong resistor values which shifts the charging rate beyond display range",
-                        "Forgetting to completely discharge capacitor before starting a new run"
-                      ]
-                    : [
-                        "Taking too few data points around the peak resonance frequency",
-                        "Connecting inductor with high internal winding resistance"
-                      ]
-                  }
+                  bubbleText={aiExplanationText}
+                  commonMistakes={commonMistakesList}
                 />
 
                 {/* Cached Viva Questions Section */}
@@ -1586,8 +1868,8 @@ export default function App() {
                 <ReportPreviewCard
                   experimentName={`${activeExperiment}`}
                   data={tableData}
-                  aim={activeExperiment === "Ohm's Law" ? "To verify Ohm's Law and calculate the resistance of the given conductor." : activeExperiment === "RC Circuit Response" ? "To study the charging and discharging characteristics of a capacitor in an RC circuit and determine the time constant." : "To study the frequency response of a series LCR circuit and find its resonant frequency."}
-                  formula={activeExperiment === "Ohm's Law" ? "V = IR" : activeExperiment === "RC Circuit Response" ? "τ = RC" : "f_r = 1 / (2π × √(L × C))"}
+                  aim={currentExperimentDetail?.aim || "To study and verify physical/electronic relationships."}
+                  formula={currentExperimentDetail?.formula || "y = mx + c"}
                   col1Config={col1Config}
                   col2Config={col2Config}
                 />
@@ -1731,7 +2013,7 @@ export default function App() {
                         <input 
                           type="text" 
                           value={profile?.fullName || ''} 
-                          onChange={(e) => setProfile(p => p ? { ...p, fullName: e.target.value } : null)}
+                          onChange={(e) => setProfile(p => ({ id: p?.id || '', email: p?.email || '', fullName: e.target.value, year: p?.year || '1st Year', department: p?.department || '' }))}
                           className="w-full bg-white border-2 border-ink-primary rounded-lg py-2 px-3 text-xs focus:outline-none focus:border-accent-orange font-bold text-ink-primary"
                         />
                       </div>
@@ -1748,7 +2030,7 @@ export default function App() {
                         <label className="block mb-1.5 uppercase font-heading text-[10px] tracking-wide text-ink-secondary">Academic Year</label>
                         <select 
                           value={profile?.year || '1st Year'} 
-                          onChange={(e) => setProfile(p => p ? { ...p, year: e.target.value } : null)}
+                          onChange={(e) => setProfile(p => ({ id: p?.id || '', email: p?.email || '', fullName: p?.fullName || '', year: e.target.value, department: p?.department || '' }))}
                           className="w-full bg-white border-2 border-ink-primary rounded-lg py-2 px-3 text-xs focus:outline-none focus:border-accent-orange font-bold text-ink-primary"
                         >
                           <option value="1st Year">1st Year (Freshman)</option>
@@ -1762,7 +2044,7 @@ export default function App() {
                         <input 
                           type="text" 
                           value={profile?.department || ''} 
-                          onChange={(e) => setProfile(p => p ? { ...p, department: e.target.value } : null)}
+                          onChange={(e) => setProfile(p => ({ id: p?.id || '', email: p?.email || '', fullName: p?.fullName || '', year: p?.year || '1st Year', department: e.target.value }))}
                           className="w-full bg-white border-2 border-ink-primary rounded-lg py-2 px-3 text-xs focus:outline-none focus:border-accent-orange font-bold text-ink-primary"
                         />
                       </div>

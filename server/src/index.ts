@@ -84,6 +84,59 @@ async function syncProfile(user: any) {
   return profile;
 }
 
+// --- Helper: Parse JSON from Gemini response robustly ---
+function parseGeminiJSON(responseText: string): any {
+  let cleanJson = responseText.trim();
+
+  // Strip markdown code fences (```json ... ``` or ``` ... ```)
+  cleanJson = cleanJson.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+
+  // Try direct parse first
+  try {
+    return JSON.parse(cleanJson);
+  } catch (_e) {
+    // Fallback: find first JSON object or array in the text
+    const objectMatch = cleanJson.match(/\{[\s\S]*\}/);
+    const arrayMatch = cleanJson.match(/\[[\s\S]*\]/);
+
+    // Pick the one that appears first
+    const objIdx = objectMatch ? cleanJson.indexOf(objectMatch[0]) : Infinity;
+    const arrIdx = arrayMatch ? cleanJson.indexOf(arrayMatch[0]) : Infinity;
+
+    const jsonStr = objIdx < arrIdx ? objectMatch?.[0] : arrayMatch?.[0];
+    if (jsonStr) {
+      try {
+        return JSON.parse(jsonStr);
+      } catch (_e2) {
+        // Log raw response for debugging
+        console.error('Failed to parse extracted JSON. Raw Gemini response:', responseText);
+        throw new Error('Gemini returned unparseable JSON');
+      }
+    }
+
+    console.error('No JSON found in Gemini response. Raw response:', responseText);
+    throw new Error('Gemini response contained no JSON');
+  }
+}
+
+// --- Helper: Apply transform to a value ---
+function applyTransform(value: number, transform: string): number {
+  switch (transform) {
+    case 'square': return value * value;
+    case 'log': return value > 0 ? Math.log10(value) : 0;
+    default: return value;
+  }
+}
+
+// --- Helper: Get transform label suffix ---
+function getTransformLabel(rawName: string, transform: string): string {
+  switch (transform) {
+    case 'square': return `${rawName}²`;
+    case 'log': return `log₁₀(${rawName})`;
+    default: return rawName;
+  }
+}
+
 // --- API ROUTES ---
 
 // 1. Auth Profile Route
@@ -112,8 +165,8 @@ app.put('/api/me', requireAuth, async (req: any, res: any) => {
   }
 });
 
-// 2. List Subjects
-app.get('/api/subjects', async (req: any, res: any) => {
+// 2. List Subjects (PUBLIC — no auth required)
+app.get('/api/subjects', async (_req: any, res: any) => {
   try {
     const experiments = await prisma.subjectExperiment.findMany({
       select: { subject: true },
@@ -126,7 +179,7 @@ app.get('/api/subjects', async (req: any, res: any) => {
   }
 });
 
-// 3. List Experiments
+// 3. List Experiments (PUBLIC — no auth required)
 app.get('/api/experiments', async (req: any, res: any) => {
   try {
     const { subject } = req.query;
@@ -142,7 +195,7 @@ app.get('/api/experiments', async (req: any, res: any) => {
   }
 });
 
-// 4. Experiment Detail
+// 4. Experiment Detail (PUBLIC — no auth required)
 app.get('/api/experiments/:id', async (req: any, res: any) => {
   try {
     const { id } = req.params;
@@ -182,30 +235,54 @@ app.post('/api/uploads', requireAuth, upload.single('photo'), async (req: any, r
   }
 });
 
-// 6. Run Gemini OCR Transcription
+// 6. Run Gemini OCR Transcription (with experiment-aware prompting)
 app.post('/api/runs', requireAuth, async (req: any, res: any) => {
   try {
     const { experimentId, imageUrl } = req.body;
     if (!experimentId || !imageUrl) {
-      return res.status(400).json({ error: 'experimentId and imageUrl are required' });
+      return res.status(400).json({ success: false, reason: 'experimentId and imageUrl are required' });
     }
 
     const experiment = await prisma.subjectExperiment.findUnique({
       where: { id: experimentId },
     });
-    if (!experiment) return res.status(404).json({ error: 'Experiment not found' });
+    if (!experiment) return res.status(404).json({ success: false, reason: 'Experiment not found' });
 
     // Sync profile first
     await syncProfile(req.user);
 
+    // Parse the experiment's expected columns/units for the OCR prompt
+    let expectedColumns: string[] = [];
+    let expectedUnits: string[] = [];
+    try {
+      expectedColumns = experiment.rawColumns ? JSON.parse(experiment.rawColumns) : [];
+      expectedUnits = experiment.rawUnits ? JSON.parse(experiment.rawUnits) : [];
+    } catch (_e) {
+      console.warn('Failed to parse experiment rawColumns/rawUnits, using defaults');
+    }
+
+    // Build experiment-aware OCR prompt
+    const columnHint = expectedColumns.length > 0
+      ? `This is an observation table for the "${experiment.name}" experiment. The expected columns are: ${expectedColumns.map((c: string, i: number) => `"${c}" (${expectedUnits[i] || ''})`).join(', ')}.`
+      : '';
+
     // Fetch image from Cloudinary to send as base64 bytes to Gemini
-    const imageResponse = await fetch(imageUrl);
-    const arrayBuffer = await imageResponse.arrayBuffer();
-    const base64Image = Buffer.from(arrayBuffer).toString('base64');
-    const mimeType = imageResponse.headers.get('content-type') || 'image/jpeg';
+    let base64Image: string;
+    let mimeType: string;
+    try {
+      const imageResponse = await fetch(imageUrl);
+      if (!imageResponse.ok) throw new Error(`Failed to fetch image: HTTP ${imageResponse.status}`);
+      const arrayBuffer = await imageResponse.arrayBuffer();
+      base64Image = Buffer.from(arrayBuffer).toString('base64');
+      mimeType = imageResponse.headers.get('content-type') || 'image/jpeg';
+    } catch (fetchErr: any) {
+      console.error('Image fetch error:', fetchErr);
+      return res.status(400).json({ success: false, reason: 'Could not retrieve the uploaded image. The URL may have expired or the image may not be publicly accessible.' });
+    }
 
     const prompt = `You are a scientific laboratory notebook OCR transcriber. 
 Transcribe the columns, units, and values from the lab notebook image into a structured JSON format.
+${columnHint}
 Analyze the handdrawn table carefully. If a cell value is smudgey, blurred, or hard to read, assign a lower confidence score (below 0.75).
 If the value is clear, assign a higher confidence score (e.g. 0.95).
 
@@ -221,6 +298,9 @@ Return ONLY a valid JSON object matching the following structure:
 DO NOT include any markdown code blocks or wrapping (e.g. do not wrap in \`\`\`json). Return raw text only.`;
 
     let parsed: any;
+    let ocrFailed = false;
+    let ocrFailReason = '';
+
     try {
       if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY.includes('placeholder')) {
         throw new Error('Gemini API Key is not configured.');
@@ -238,53 +318,38 @@ DO NOT include any markdown code blocks or wrapping (e.g. do not wrap in \`\`\`j
       ]);
 
       const responseText = result.response.text();
-      let cleanJson = responseText.trim();
-      if (cleanJson.startsWith('```')) {
-        cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```$/, '').trim();
+      parsed = parseGeminiJSON(responseText);
+
+      // Validate parsed structure
+      if (!parsed.columns || !parsed.rows || !Array.isArray(parsed.rows)) {
+        console.error('Gemini returned valid JSON but wrong structure:', parsed);
+        throw new Error('OCR result structure is invalid');
       }
-      parsed = JSON.parse(cleanJson);
     } catch (geminiErr: any) {
-      console.warn('Gemini OCR transcription failed, falling back to mock database defaults:', geminiErr.message);
-      
-      // Select appropriate high-fidelity mock data based on experiment name
-      if (experiment.name.includes("Ohm")) {
+      console.warn('Gemini OCR transcription failed:', geminiErr.message);
+
+      // Try experiment-specific mock data fallback
+      if (expectedColumns.length >= 2) {
+        // Generate a generic mock dataset based on the experiment's expected columns
+        ocrFailed = true;
+        ocrFailReason = geminiErr.message;
         parsed = {
-          columns: ["Voltage", "Current"],
-          units: ["V", "mA"],
+          columns: expectedColumns,
+          units: expectedUnits,
           rows: [
             { index: 0, values: [1.0, 10.0], confidences: [0.95, 0.95] },
-            { index: 1, values: [2.0, 20.2], confidences: [0.95, 0.95] },
-            { index: 2, values: [3.0, 30.5], confidences: [0.95, 0.95] },
-            { index: 3, values: [4.0, 39.8], confidences: [0.95, 0.95] },
-            { index: 4, values: [5.0, 50.1], confidences: [0.95, 0.95] }
-          ]
-        };
-      } else if (experiment.name.includes("RC")) {
-        parsed = {
-          columns: ["Time", "Voltage"],
-          units: ["ms", "V"],
-          rows: [
-            { index: 0, values: [0.0, 0.0], confidences: [0.95, 0.95] },
-            { index: 1, values: [1.0, 1.58], confidences: [0.95, 0.95] },
-            { index: 2, values: [2.0, 2.82], confidences: [0.95, 0.95] },
-            { index: 3, values: [3.0, 3.79], confidences: [0.95, 0.95] },
-            { index: 4, values: [4.0, 4.56], confidences: [0.95, 0.95] },
-            { index: 5, values: [5.0, 5.18], confidences: [0.95, 0.95] }
+            { index: 1, values: [2.0, 20.0], confidences: [0.95, 0.95] },
+            { index: 2, values: [3.0, 30.0], confidences: [0.95, 0.95] },
+            { index: 3, values: [4.0, 40.0], confidences: [0.95, 0.95] },
+            { index: 4, values: [5.0, 50.0], confidences: [0.95, 0.95] },
           ]
         };
       } else {
-        parsed = {
-          columns: ["Frequency", "Current"],
-          units: ["Hz", "mA"],
-          rows: [
-            { index: 0, values: [100.0, 5.0], confidences: [0.95, 0.95] },
-            { index: 1, values: [200.0, 12.0], confidences: [0.95, 0.95] },
-            { index: 2, values: [500.0, 35.0], confidences: [0.95, 0.95] },
-            { index: 3, values: [1000.0, 80.0], confidences: [0.95, 0.95] },
-            { index: 4, values: [2000.0, 42.0], confidences: [0.95, 0.95] },
-            { index: 5, values: [5000.0, 15.0], confidences: [0.95, 0.95] }
-          ]
-        };
+        // No recipe available — return structured error to frontend
+        return res.status(422).json({
+          success: false,
+          reason: `We couldn't read this image clearly — ${geminiErr.message}. Try a clearer photo or better lighting.`
+        });
       }
     }
 
@@ -310,7 +375,7 @@ DO NOT include any markdown code blocks or wrapping (e.g. do not wrap in \`\`\`j
             runId: run.id,
             rowIndex: r.index,
             columnName: parsed.columns[0] || 'Column 1',
-            unit: parsed.units[0] || '',
+            unit: parsed.units?.[0] || '',
             value: r.values[0] || 0,
             ocrConfidence: r.confidences?.[0] || 0.95,
           }
@@ -320,7 +385,7 @@ DO NOT include any markdown code blocks or wrapping (e.g. do not wrap in \`\`\`j
             runId: run.id,
             rowIndex: r.index,
             columnName: parsed.columns[1] || 'Column 2',
-            unit: parsed.units[1] || '',
+            unit: parsed.units?.[1] || '',
             value: r.values[1] || 0,
             ocrConfidence: r.confidences?.[1] || 0.95,
           }
@@ -339,20 +404,23 @@ DO NOT include any markdown code blocks or wrapping (e.g. do not wrap in \`\`\`j
       col2Confidence: r.confidences?.[1] || 0.95,
       col1Name: parsed.columns[0] || 'Column 1',
       col2Name: parsed.columns[1] || 'Column 2',
-      col1Unit: parsed.units[0] || '',
-      col2Unit: parsed.units[1] || '',
+      col1Unit: parsed.units?.[0] || '',
+      col2Unit: parsed.units?.[1] || '',
     }));
 
     return res.json({
+      success: true,
       runId: run.id,
       ocrConfidence: avgOcrConf,
       rows: formattedRows,
-      col1Config: { name: parsed.columns[0] || 'Column 1', unit: parsed.units[0] || '' },
-      col2Config: { name: parsed.columns[1] || 'Column 2', unit: parsed.units[1] || '' },
+      col1Config: { name: parsed.columns[0] || 'Column 1', unit: parsed.units?.[0] || '' },
+      col2Config: { name: parsed.columns[1] || 'Column 2', unit: parsed.units?.[1] || '' },
+      ocrFallback: ocrFailed,
+      ocrFallbackReason: ocrFailReason,
     });
   } catch (err: any) {
     console.error('OCR processing error:', err);
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ success: false, reason: err.message || 'An unexpected error occurred during processing.' });
   }
 });
 
@@ -447,7 +515,7 @@ app.patch('/api/runs/:runId/rows', requireAuth, async (req: any, res: any) => {
   }
 });
 
-// 8. Graph calculation & regression
+// 8. Graph calculation & regression (with per-experiment transform support)
 app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
   try {
     const { runId } = req.params;
@@ -464,8 +532,12 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
 
     if (dbRows.length === 0) return res.status(400).json({ error: 'No observation data available' });
 
-    // Pivot rows to XY pairs
-    const pairs: { x: number; y: number }[] = [];
+    const experiment = run.experiment;
+    const xTransform = experiment.xTransform || 'none';
+    const yTransform = experiment.yTransform || 'none';
+
+    // Pivot rows to raw XY pairs
+    const rawPairs: { x: number; y: number }[] = [];
     const rowMap = new Map<number, { x?: number; y?: number }>();
     dbRows.forEach((r: any) => {
       if (!rowMap.has(r.rowIndex)) rowMap.set(r.rowIndex, {});
@@ -477,24 +549,29 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
 
     rowMap.forEach((p) => {
       if (p.x !== undefined && p.y !== undefined) {
-        pairs.push({ x: p.x, y: p.y });
+        rawPairs.push({ x: p.x, y: p.y });
       }
     });
 
-    // Run Linear Regression: y = mx + c
+    // Apply transforms to get plotted values
+    const pairs = rawPairs.map(p => ({
+      x: applyTransform(p.x, xTransform),
+      y: applyTransform(p.y, yTransform),
+    }));
+
+    // Run Linear Regression on transformed values: y = mx + c
     const n = pairs.length;
     let slope = 0;
     let intercept = 0;
     let rSquared = 1.0;
 
     if (n > 0) {
-      let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0, sumYY = 0;
+      let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
       pairs.forEach((p) => {
         sumX += p.x;
         sumY += p.y;
         sumXY += p.x * p.y;
         sumXX += p.x * p.x;
-        sumYY += p.y * p.y;
       });
 
       const denominator = n * sumXX - sumX * sumX;
@@ -511,9 +588,14 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
       rSquared = sst !== 0 ? 1 - (ssr / sst) : 1.0;
     }
 
-    // Determine config labels and units
-    const col1Config = { name: dbRows[0]?.columnName || 'Voltage', unit: dbRows[0]?.unit || 'V' };
-    const col2Config = { name: dbRows[1]?.columnName || 'Current', unit: dbRows[1]?.unit || 'mA' };
+    // Determine axis labels from experiment recipe
+    const col1RawName = dbRows[0]?.columnName || 'X';
+    const col2RawName = dbRows.find((r: any) => r.id !== dbRows.filter((x: any) => x.rowIndex === dbRows[0].rowIndex)[0].id)?.columnName || 'Y';
+    const col1Unit = dbRows[0]?.unit || '';
+    const col2Unit = dbRows.find((r: any) => r.id !== dbRows.filter((x: any) => x.rowIndex === dbRows[0].rowIndex)[0].id)?.unit || '';
+
+    const xLabel = experiment.xAxisLabel || `${getTransformLabel(col1RawName, xTransform)} (${col1Unit})`;
+    const yLabel = experiment.yAxisLabel || `${getTransformLabel(col2RawName, yTransform)} (${col2Unit})`;
 
     // Calculate dynamic boundaries with 20% padding
     const xVals = pairs.map((p) => p.x);
@@ -523,50 +605,73 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
     const yAxisMin = Math.min(...yVals, 0);
     const yAxisMax = Math.max(...yVals, 50) * 1.2;
 
-    const suggestedScale = `1 small division = ${(xAxisMax / 50).toFixed(2)} ${col1Config.unit} on X-axis, ${(yAxisMax / 50).toFixed(2)} ${col2Config.unit} on Y-axis`;
+    const suggestedScale = `1 small division = ${(xAxisMax / 50).toFixed(2)} on X-axis, ${(yAxisMax / 50).toFixed(2)} on Y-axis`;
 
-    // Construct worked step-by-step substitution text based on experiment type
+    // Generate dynamic calculation text based on experiment
     let calculationText = '';
-    const expName = run.experiment.name;
+    const expName = experiment.name;
 
+    if (xTransform !== 'none' || yTransform !== 'none') {
+      // Show transformation steps
+      calculationText += `Step 1: Apply data transformations\n`;
+      if (xTransform === 'square') {
+        calculationText += `X-axis: ${col1RawName} → ${col1RawName}² (squared)\n`;
+      } else if (xTransform === 'log') {
+        calculationText += `X-axis: ${col1RawName} → log₁₀(${col1RawName})\n`;
+      }
+      if (yTransform === 'square') {
+        calculationText += `Y-axis: ${col2RawName} → ${col2RawName}² (squared)\n`;
+      } else if (yTransform === 'log') {
+        calculationText += `Y-axis: ${col2RawName} → log₁₀(${col2RawName})\n`;
+      }
+      calculationText += `\n`;
+    }
+
+    calculationText += `Step ${xTransform !== 'none' || yTransform !== 'none' ? '2' : '1'}: Calculate the slope (m) from the line of best fit\n`;
+    calculationText += `m = Δ(${yLabel}) / Δ(${xLabel}) = ${slope.toFixed(4)}\n\n`;
+
+    calculationText += `Step ${xTransform !== 'none' || yTransform !== 'none' ? '3' : '2'}: Y-intercept\n`;
+    calculationText += `c = ${intercept.toFixed(4)}\n\n`;
+
+    calculationText += `Step ${xTransform !== 'none' || yTransform !== 'none' ? '4' : '3'}: R² (goodness of fit)\n`;
+    calculationText += `R² = ${rSquared.toFixed(4)}\n\n`;
+
+    // Experiment-specific derived calculations
     if (expName === "Ohm's Law") {
       let factor = 1.0;
-      if (col2Config.unit === 'mA') factor = 1000.0;
-      else if (col2Config.unit === 'µA') factor = 1000000.0;
-      if (col1Config.unit === 'mV') factor = factor / 1000.0;
-      else if (col1Config.unit === 'kV') factor = factor * 1000.0;
-
+      if (col2Unit === 'mA') factor = 1000.0;
+      else if (col2Unit === 'µA') factor = 1000000.0;
       const resistance = slope !== 0 ? factor / slope : 100.0;
-
-      calculationText = `Step 1: Calculate the slope (m) from the line of best fit
-m = ΔI / ΔV = ${slope.toFixed(4)} ${col2Config.unit}/${col1Config.unit}
-
-Step 2: Convert slope to base SI units (Amperes / Volt)
-m = ${slope.toFixed(4)} × 10⁻³ A/V = ${(slope / 1000).toFixed(6)} A/V
-
-Step 3: Substitute into the Resistance formula
-R = 1 / m = 1 / ${(slope / 1000).toFixed(6)} = ${resistance.toFixed(1)} Ω`;
-    } else if (expName === "RC Circuit Response") {
-      const maxVal = yVals.length > 0 ? Math.max(...yVals) : 5.0;
-      const tau = slope !== 0 ? Math.abs(1.5 / slope) : 2.5;
-
-      calculationText = `Step 1: Determine the maximum voltage (V_max)
-V_max = ${maxVal.toFixed(2)} V
-
-Step 2: Find target voltage at 63.2% charge
-V_target = 0.632 × V_max = ${(0.632 * maxVal).toFixed(2)} V
-
-Step 3: Find corresponding time constant (τ) from the charging characteristics
-Time Constant τ = ${tau.toFixed(2)} ms`;
+      calculationText += `Step 4: Calculate Resistance\n`;
+      calculationText += `R = 1 / slope = 1 / ${(slope / factor).toFixed(6)} A/V = ${resistance.toFixed(1)} Ω`;
+    } else if (expName === 'Simple Pendulum') {
+      // slope = T²/L → g = 4π²/slope
+      const g = slope !== 0 ? (4 * Math.PI * Math.PI) / (slope / 100) : 9.8; // convert cm to m
+      calculationText += `Step 5: Calculate g from slope\n`;
+      calculationText += `slope = T²/L = ${slope.toFixed(4)} s²/cm\n`;
+      calculationText += `g = 4π²/slope = 4 × ${Math.PI.toFixed(4)}² / ${(slope / 100).toFixed(4)} = ${g.toFixed(2)} m/s²`;
+    } else if (expName === "Stefan's Law") {
+      calculationText += `Step 5: Verify Stefan's Law\n`;
+      calculationText += `Expected slope ≈ 4 (since P ∝ T⁴)\n`;
+      calculationText += `Measured slope = ${slope.toFixed(2)}\n`;
+      calculationText += `${Math.abs(slope - 4) < 0.5 ? '✓ Stefan\'s Law is verified!' : 'Note: Deviation from expected value of 4.'}`;
+    } else if (expName === "Newton's Rings") {
+      calculationText += `Step 5: Calculate wavelength\n`;
+      calculationText += `slope = D²/n = ${slope.toFixed(4)} cm²\n`;
+      calculationText += `λ = slope / (4R) (where R is the radius of curvature of the lens)`;
+    } else if (expName === "Hooke's Law (Spring)") {
+      const k = slope;
+      calculationText += `Step 4: Calculate spring constant\n`;
+      calculationText += `k = slope = ${k.toFixed(3)} N/cm = ${(k * 100).toFixed(1)} N/m`;
+    } else if (expName === "Planck's Constant (LED)") {
+      const e = 1.6e-19;
+      const h = slope * e * 1e-14; // frequency in 10^14 Hz
+      calculationText += `Step 5: Calculate Planck's constant\n`;
+      calculationText += `slope = h/e = ${slope.toFixed(4)} V/(10¹⁴ Hz)\n`;
+      calculationText += `h = slope × e = ${h.toExponential(2)} J·s`;
     } else {
-      const maxVal = yVals.length > 0 ? Math.max(...yVals) : 50.0;
-      const f_r = slope !== 0 ? Math.abs(8.2 * slope) : 1000;
-
-      calculationText = `Step 1: Identify frequency of maximum current (I_max)
-I_max = ${maxVal.toFixed(1)} mA
-
-Step 2: Find Peak Resonant Frequency from curve peak
-f_r = ${f_r.toFixed(0)} Hz`;
+      // Generic
+      calculationText += `The best-fit line equation is: y = ${slope.toFixed(4)}x + ${intercept.toFixed(4)}`;
     }
 
     // Upsert GraphResult
@@ -597,15 +702,21 @@ f_r = ${f_r.toFixed(0)} Hz`;
       },
     });
 
-    return res.json(graphResult);
+    return res.json({
+      ...graphResult,
+      xTransform,
+      yTransform,
+      xAxisLabelText: xLabel,
+      yAxisLabelText: yLabel,
+    });
   } catch (err: any) {
     console.error('Graph calculation error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// 9. Theory caching and generation
-app.get('/api/experiments/:id/theory', requireAuth, async (req: any, res: any) => {
+// 9. Theory caching and generation (PUBLIC — no auth required)
+app.get('/api/experiments/:id/theory', async (req: any, res: any) => {
   try {
     const { id } = req.params;
     const experiment = await prisma.subjectExperiment.findUnique({
@@ -632,42 +743,38 @@ Return your output as a raw JSON object with exactly these fields (no markdown w
   "simple": "A simple plain-English explanation using common analogies (e.g. water pipes for electricity, swings for resonance)"
 }`;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    let cleanJson = responseText.trim();
-    if (cleanJson.startsWith('```')) {
-      cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```$/, '').trim();
-    }
-
-    let parsed: any;
     try {
-      parsed = JSON.parse(cleanJson);
-    } catch {
-      parsed = {
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      const parsed = parseGeminiJSON(responseText);
+
+      // Cache to DB
+      await prisma.subjectExperiment.update({
+        where: { id },
+        data: {
+          theoryFormal: parsed.formal,
+          theorySimple: parsed.simple,
+        },
+      });
+
+      return res.json(parsed);
+    } catch (_geminiErr) {
+      // Fallback if Gemini fails
+      const fallback = {
         formal: experiment.aim,
         simple: "In simple terms: we are measuring how the input changes the output to verify basic physical rules.",
       };
+      return res.json(fallback);
     }
-
-    // Cache to DB
-    await prisma.subjectExperiment.update({
-      where: { id },
-      data: {
-        theoryFormal: parsed.formal,
-        theorySimple: parsed.simple,
-      },
-    });
-
-    return res.json(parsed);
   } catch (err: any) {
     console.error('Theory generation error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// 10. Viva questions caching and generation
-app.get('/api/experiments/:id/viva', requireAuth, async (req: any, res: any) => {
+// 10. Viva questions caching and generation (PUBLIC — no auth required)
+app.get('/api/experiments/:id/viva', async (req: any, res: any) => {
   try {
     const { id } = req.params;
     const experiment = await prisma.subjectExperiment.findUnique({
@@ -691,37 +798,33 @@ Return ONLY a raw JSON string matching the following structure (no markdown wrap
   { "category": "basic", "question": "Question text here?", "answer": "Model answer text here." }
 ]`;
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
-    let cleanJson = responseText.trim();
-    if (cleanJson.startsWith('```')) {
-      cleanJson = cleanJson.replace(/^```json\s*/, '').replace(/```$/, '').trim();
-    }
-
-    let parsed: any[];
     try {
-      parsed = JSON.parse(cleanJson);
-    } catch {
-      parsed = [
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      const parsed = parseGeminiJSON(responseText);
+
+      // Write to DB
+      const creationPromises = (Array.isArray(parsed) ? parsed : [parsed]).map((q: any) => {
+        return prisma.vivaQuestion.create({
+          data: {
+            experimentId: id,
+            category: q.category || 'basic',
+            question: q.question || '',
+            answer: q.answer || '',
+          },
+        });
+      });
+
+      const savedQuestions = await Promise.all(creationPromises);
+      return res.json(savedQuestions);
+    } catch (_geminiErr) {
+      // Fallback
+      const fallback = [
         { category: "basic", question: `What is the aim of the ${experiment.name} experiment?`, answer: experiment.aim }
       ];
+      return res.json(fallback);
     }
-
-    // Write to DB
-    const creationPromises = parsed.map((q) => {
-      return prisma.vivaQuestion.create({
-        data: {
-          experimentId: id,
-          category: q.category || 'basic',
-          question: q.question || '',
-          answer: q.answer || '',
-        },
-      });
-    });
-
-    const savedQuestions = await Promise.all(creationPromises);
-    return res.json(savedQuestions);
   } catch (err: any) {
     console.error('Viva generation error:', err);
     return res.status(500).json({ error: err.message });
@@ -755,9 +858,8 @@ app.post('/api/runs/:runId/report', requireAuth, async (req: any, res: any) => {
 });
 
 // 12. Admin Stats
-app.get('/api/admin/stats', requireAuth, async (req: any, res: any) => {
+app.get('/api/admin/stats', requireAuth, async (_req: any, res: any) => {
   try {
-    // Check if requester is an admin (in a simple app we check if email ends with admin domain, or just allow logged in students)
     const userCount = await prisma.profile.count();
     const runsCount = await prisma.experimentRun.count();
     
@@ -769,7 +871,7 @@ app.get('/api/admin/stats', requireAuth, async (req: any, res: any) => {
 
     return res.json({
       totalUsers: userCount,
-      monthlyActiveUsers: userCount, // for MVP, equals total registered users
+      monthlyActiveUsers: userCount,
       runsToday,
       totalRuns: runsCount,
     });

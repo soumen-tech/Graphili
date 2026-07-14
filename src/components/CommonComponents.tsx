@@ -249,7 +249,8 @@ export const ToggleRow: React.FC<{
 export const UploadDropzone: React.FC<{
   onUploadStart: () => void;
   onUpload?: (file: File) => void;
-}> = ({ onUploadStart, onUpload }) => {
+  onPasteText?: (text: string) => void;
+}> = ({ onUploadStart, onUpload, onPasteText }) => {
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const cameraInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -269,11 +270,21 @@ export const UploadDropzone: React.FC<{
     cameraInputRef.current?.click();
   };
 
+  // Check if text looks like a table (tab or comma-separated with multiple rows)
+  const isStructuredText = (text: string): boolean => {
+    const lines = text.trim().split('\n').filter(l => l.trim().length > 0);
+    if (lines.length < 2) return false;
+    // Check if at least 2 lines have tabs or commas as delimiters
+    const hasDelimiters = lines.filter(l => l.includes('\t') || l.includes(',')).length >= 2;
+    return hasDelimiters;
+  };
+
   const handlePasteClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
       const clipboardItems = await navigator.clipboard.read();
       for (const item of clipboardItems) {
+        // Check for images first
         for (const type of item.types) {
           if (type.startsWith('image/')) {
             const blob = await item.getType(type);
@@ -285,9 +296,28 @@ export const UploadDropzone: React.FC<{
             return;
           }
         }
+        // Check for text (structured table data from Excel/Sheets)
+        for (const type of item.types) {
+          if (type === 'text/plain') {
+            const blob = await item.getType(type);
+            const text = await blob.text();
+            if (isStructuredText(text) && onPasteText) {
+              onPasteText(text);
+              return;
+            }
+          }
+        }
       }
-      alert("No image found in your clipboard. Please copy an image first, then paste it here.");
-    } catch (err) {
+      alert("No image or table data found in your clipboard. Please copy an image or table first, then paste it here.");
+    } catch (_err) {
+      // Fallback: try reading text from clipboard
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text && isStructuredText(text) && onPasteText) {
+          onPasteText(text);
+          return;
+        }
+      } catch (_e2) { /* ignore */ }
       alert("Clipboard access was blocked or is not supported by your browser. Please copy an image, select this page, and press Ctrl + V (or Cmd + V) to paste.");
     }
   };
@@ -314,14 +344,28 @@ export const UploadDropzone: React.FC<{
     const handleGlobalPaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
+
+      // Check for images first
       for (let i = 0; i < items.length; i++) {
         if (items[i].type.indexOf('image') !== -1) {
           const file = items[i].getAsFile();
           if (file) {
             if (onUpload) onUpload(file);
             onUploadStart();
-            break;
+            return;
           }
+        }
+      }
+
+      // Check for structured text
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type === 'text/plain') {
+          items[i].getAsString((text) => {
+            if (isStructuredText(text) && onPasteText) {
+              onPasteText(text);
+            }
+          });
+          return;
         }
       }
     };
@@ -330,7 +374,7 @@ export const UploadDropzone: React.FC<{
     return () => {
       window.removeEventListener('paste', handleGlobalPaste);
     };
-  }, [onUpload, onUploadStart]);
+  }, [onUpload, onUploadStart, onPasteText]);
 
   return (
     <div 
@@ -368,11 +412,11 @@ export const UploadDropzone: React.FC<{
           📁 Browse Files
         </button>
         <button onClick={handlePasteClick} className="px-4 py-1.5 bg-paper-card border border-ink-primary rounded-lg text-xs font-bold text-ink-primary hover:bg-ink-primary/5 transition-all shadow-[1.5px_1.5px_0px_0px_rgba(44,62,80,1)] active:translate-x-[0.5px] active:translate-y-[0.5px] cursor-pointer">
-          📋 Paste Image
+          📋 Paste Image / Table
         </button>
       </div>
       
-      <p className="text-[10px] text-ink-secondary/70 mt-6 font-semibold">Supports: JPG, PNG, JPEG (Max 10MB) or Ctrl+V to paste</p>
+      <p className="text-[10px] text-ink-secondary/70 mt-6 font-semibold">Supports: JPG, PNG, JPEG (Max 10MB) • Ctrl+V to paste image or table data from Excel/Sheets</p>
     </div>
   );
 };
@@ -381,7 +425,10 @@ export const UploadDropzone: React.FC<{
 export const AIProcessingChecklist: React.FC<{
   currentStep: number;
   progress: number;
-}> = ({ currentStep, progress }) => {
+  errorMessage?: string | null;
+  onRetry?: () => void;
+  onReupload?: () => void;
+}> = ({ currentStep, progress, errorMessage, onRetry, onReupload }) => {
   const steps = [
     'Reading image...',
     'Extracting values...',
@@ -390,6 +437,39 @@ export const AIProcessingChecklist: React.FC<{
     'Formatting data...',
     'Almost done...',
   ];
+
+  // Error state UI
+  if (errorMessage) {
+    return (
+      <div className="w-full max-w-sm flex flex-col gap-4 items-center">
+        <div className="p-4 bg-accent-red-orange/10 border-2 border-accent-red-orange rounded-xl text-center">
+          <div className="text-2xl mb-2">😔</div>
+          <h4 className="text-sm font-bold font-heading text-accent-red-orange mb-2">Processing Failed</h4>
+          <p className="text-xs font-semibold text-ink-primary leading-relaxed mb-4">
+            {errorMessage}
+          </p>
+          <div className="flex flex-wrap items-center justify-center gap-3">
+            {onRetry && (
+              <button 
+                onClick={onRetry}
+                className="px-4 py-2 bg-accent-orange text-white border border-ink-primary rounded-lg text-xs font-bold hover:bg-accent-orange-dark transition-all shadow-[1.5px_1.5px_0px_0px_rgba(44,62,80,1)] active:translate-x-[0.5px] active:translate-y-[0.5px] cursor-pointer"
+              >
+                🔄 Retry
+              </button>
+            )}
+            {onReupload && (
+              <button 
+                onClick={onReupload}
+                className="px-4 py-2 bg-paper-card border border-ink-primary rounded-lg text-xs font-bold text-ink-primary hover:bg-ink-primary/5 transition-all shadow-[1.5px_1.5px_0px_0px_rgba(44,62,80,1)] active:translate-x-[0.5px] active:translate-y-[0.5px] cursor-pointer"
+              >
+                📤 Re-upload Photo
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full max-w-sm flex flex-col gap-4">
@@ -434,3 +514,4 @@ export const AIProcessingChecklist: React.FC<{
     </div>
   );
 };
+

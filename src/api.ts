@@ -2,7 +2,7 @@ import { supabase } from './supabaseClient';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
 
-async function getHeaders() {
+async function getAuthHeaders() {
   const session = (await supabase.auth.getSession()).data.session;
   return {
     'Content-Type': 'application/json',
@@ -29,6 +29,15 @@ export interface SubjectExperiment {
   applications?: string;
   theoryFormal?: string;
   theorySimple?: string;
+  // Graph recipe fields
+  rawColumns?: string;  // JSON string
+  rawUnits?: string;    // JSON string
+  xTransform?: string;
+  yTransform?: string;
+  xAxisLabel?: string;
+  yAxisLabel?: string;
+  plotXColumn?: number;
+  plotYColumn?: number;
 }
 
 export interface VivaQuestion {
@@ -60,6 +69,10 @@ export interface GraphResult {
   yAxisMax: number;
   suggestedScale: string;
   calculationText: string;
+  xTransform?: string;
+  yTransform?: string;
+  xAxisLabelText?: string;
+  yAxisLabelText?: string;
 }
 
 export interface ExperimentRun {
@@ -71,17 +84,29 @@ export interface ExperimentRun {
   experiment: SubjectExperiment;
 }
 
+export interface RunResult {
+  success: boolean;
+  runId?: string;
+  ocrConfidence?: number;
+  rows?: ObservationRow[];
+  col1Config?: { name: string; unit: string };
+  col2Config?: { name: string; unit: string };
+  ocrFallback?: boolean;
+  ocrFallbackReason?: string;
+  reason?: string;
+}
+
 // --- API Calls ---
 
 export async function getProfile(): Promise<Profile> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/me`, { headers });
   if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch profile');
   return res.json();
 }
 
 export async function updateProfile(data: { fullName: string; year: string; department: string }): Promise<Profile> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/me`, {
     method: 'PUT',
     headers,
@@ -91,28 +116,39 @@ export async function updateProfile(data: { fullName: string; year: string; depa
   return res.json();
 }
 
+// PUBLIC endpoints — do not require auth
 export async function getSubjects(): Promise<string[]> {
-  const headers = await getHeaders();
-  const res = await fetch(`${API_URL}/subjects`, { headers });
-  if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch subjects');
+  const res = await fetch(`${API_URL}/subjects`);
+  if (!res.ok) throw new Error('Failed to fetch subjects');
   return res.json();
 }
 
 export async function getExperiments(subject?: string): Promise<SubjectExperiment[]> {
-  const headers = await getHeaders();
   const url = subject ? `${API_URL}/experiments?subject=${encodeURIComponent(subject)}` : `${API_URL}/experiments`;
-  const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch experiments');
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Failed to fetch experiments');
   return res.json();
 }
 
 export async function getExperiment(id: string): Promise<SubjectExperiment & { vivaQuestions: VivaQuestion[] }> {
-  const headers = await getHeaders();
-  const res = await fetch(`${API_URL}/experiments/${id}`, { headers });
-  if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch experiment details');
+  const res = await fetch(`${API_URL}/experiments/${id}`);
+  if (!res.ok) throw new Error('Failed to fetch experiment details');
   return res.json();
 }
 
+export async function getTheory(experimentId: string): Promise<{ formal: string; simple: string }> {
+  const res = await fetch(`${API_URL}/experiments/${experimentId}/theory`);
+  if (!res.ok) throw new Error('Failed to fetch theory');
+  return res.json();
+}
+
+export async function getViva(experimentId: string): Promise<VivaQuestion[]> {
+  const res = await fetch(`${API_URL}/experiments/${experimentId}/viva`);
+  if (!res.ok) throw new Error('Failed to fetch viva questions');
+  return res.json();
+}
+
+// AUTH-GATED endpoints
 export async function uploadPhoto(file: File): Promise<string> {
   const session = (await supabase.auth.getSession()).data.session;
   const formData = new FormData();
@@ -129,21 +165,19 @@ export async function uploadPhoto(file: File): Promise<string> {
   return (await res.json()).imageUrl;
 }
 
-export async function createRun(experimentId: string, imageUrl: string): Promise<{
-  runId: string;
-  ocrConfidence: number;
-  rows: ObservationRow[];
-  col1Config: { name: string; unit: string };
-  col2Config: { name: string; unit: string };
-}> {
-  const headers = await getHeaders();
+export async function createRun(experimentId: string, imageUrl: string): Promise<RunResult> {
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/runs`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ experimentId, imageUrl }),
   });
-  if (!res.ok) throw new Error((await res.json()).error || 'OCR transcription failed');
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) {
+    // Return structured error from server
+    return { success: false, reason: data.reason || data.error || 'OCR transcription failed' };
+  }
+  return data;
 }
 
 export async function getRows(runId: string): Promise<{
@@ -151,7 +185,7 @@ export async function getRows(runId: string): Promise<{
   col1Config: { name: string; unit: string };
   col2Config: { name: string; unit: string };
 }> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/runs/${runId}/rows`, { headers });
   if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch table rows');
   return res.json();
@@ -163,7 +197,7 @@ export async function saveRows(
   col1Config: { name: string; unit: string },
   col2Config: { name: string; unit: string }
 ): Promise<{ success: boolean }> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/runs/${runId}/rows`, {
     method: 'PATCH',
     headers,
@@ -174,7 +208,7 @@ export async function saveRows(
 }
 
 export async function generateGraph(runId: string): Promise<GraphResult> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/runs/${runId}/graph`, {
     method: 'POST',
     headers,
@@ -183,22 +217,8 @@ export async function generateGraph(runId: string): Promise<GraphResult> {
   return res.json();
 }
 
-export async function getTheory(experimentId: string): Promise<{ formal: string; simple: string }> {
-  const headers = await getHeaders();
-  const res = await fetch(`${API_URL}/experiments/${experimentId}/theory`, { headers });
-  if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch theory');
-  return res.json();
-}
-
-export async function getViva(experimentId: string): Promise<VivaQuestion[]> {
-  const headers = await getHeaders();
-  const res = await fetch(`${API_URL}/experiments/${experimentId}/viva`, { headers });
-  if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch viva questions');
-  return res.json();
-}
-
 export async function generateReport(runId: string): Promise<{ pdfUrl: string }> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/runs/${runId}/report`, {
     method: 'POST',
     headers,
@@ -208,7 +228,7 @@ export async function generateReport(runId: string): Promise<{ pdfUrl: string }>
 }
 
 export async function getHistory(): Promise<ExperimentRun[]> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/history`, { headers });
   if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch run history');
   return res.json();
@@ -220,7 +240,7 @@ export async function getAdminStats(): Promise<{
   runsToday: number;
   totalRuns: number;
 }> {
-  const headers = await getHeaders();
+  const headers = await getAuthHeaders();
   const res = await fetch(`${API_URL}/admin/stats`, { headers });
   if (!res.ok) throw new Error((await res.json()).error || 'Failed to fetch admin stats');
   return res.json();

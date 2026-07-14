@@ -28,6 +28,15 @@ model SubjectExperiment {
   procedure       String?
   precautions     String?
   applications    String?
+  // Graph Recipe fields
+  rawColumns      String?  // JSON array: e.g. '["Voltage","Current"]'
+  rawUnits        String?  // JSON array: e.g. '["V","mA"]'
+  xTransform      String   @default("none") // "none" | "square" | "log"
+  yTransform      String   @default("none") // "none" | "square" | "log"
+  xAxisLabel      String?  // e.g. "T² (s²)" — overrides raw column name on graph
+  yAxisLabel      String?  // e.g. "L (cm)"
+  plotXColumn     Int      @default(0) // 0-indexed: which raw column is X
+  plotYColumn     Int      @default(1) // 0-indexed: which raw column is Y
   vivaQuestions   VivaQuestion[]
   runs            ExperimentRun[]
 }
