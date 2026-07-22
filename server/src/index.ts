@@ -211,26 +211,67 @@ app.get('/api/experiments/:id', async (req: any, res: any) => {
   }
 });
 
-// 5. Cloudinary Upload Endpoint
+// 5. Image Upload Endpoint (Supabase Storage with Cloudinary fallback)
 app.post('/api/uploads', requireAuth, upload.single('photo'), async (req: any, res: any) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    const uploadPromise = new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        { folder: 'graphlab_ai', resource_type: 'image' },
-        (error, result) => {
-          if (error) reject(error);
-          else resolve(result);
-        }
-      );
-      stream.end(req.file.buffer);
-    });
+    const bucketName = 'graphlab_ai';
 
-    const result: any = await uploadPromise;
-    return res.json({ imageUrl: result.secure_url });
+    // Lazy assure bucket exists
+    try {
+      const { data: buckets } = await supabase.storage.listBuckets();
+      const exists = buckets?.find(b => b.name === bucketName);
+      if (!exists) {
+        await supabase.storage.createBucket(bucketName, {
+          public: true,
+          allowedMimeTypes: ['image/png', 'image/jpeg', 'image/jpg'],
+          fileSizeLimit: 10485760 // 10MB
+        });
+      }
+    } catch (bucketErr) {
+      console.warn('Assure bucket check failed, continuing upload anyway:', bucketErr);
+    }
+
+    const filename = `${req.user.id}_${Date.now()}_${req.file.originalname.replace(/[^a-zA-Z0-9.]/g, '_')}`;
+
+    // Upload to Supabase Storage
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from(bucketName)
+      .upload(filename, req.file.buffer, {
+        contentType: req.file.mimetype || 'image/png',
+        upsert: true
+      });
+
+    if (uploadError) {
+      console.error('Supabase upload failed, trying Cloudinary fallback...', uploadError);
+      
+      // Fallback to Cloudinary if configured
+      if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+        const uploadPromise = new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { folder: 'graphlab_ai', resource_type: 'image' },
+            (error, result) => {
+              if (error) reject(error);
+              else resolve(result);
+            }
+          );
+          stream.end(req.file.buffer);
+        });
+        const result: any = await uploadPromise;
+        return res.json({ imageUrl: result.secure_url });
+      }
+      throw uploadError;
+    }
+
+    // Get public URL from Supabase Storage
+    const { data: urlData } = supabase.storage
+      .from(bucketName)
+      .getPublicUrl(filename);
+
+    return res.json({ imageUrl: urlData.publicUrl });
   } catch (err: any) {
-    console.error('Cloudinary upload error:', err);
+    console.error('Upload handler error:', err);
     return res.status(500).json({ error: err.message || 'Image upload failed' });
   }
 });
@@ -435,7 +476,18 @@ app.get('/api/runs/:runId/rows', requireAuth, async (req: any, res: any) => {
 
     if (dbRows.length === 0) return res.json({ rows: [], col1Config: { name: 'X', unit: '' }, col2Config: { name: 'Y', unit: '' } });
 
-    // Pivot table rows
+    // Determine the two distinct column names from the data
+    const distinctColNames: string[] = [];
+    for (const r of dbRows as any[]) {
+      if (!distinctColNames.includes(r.columnName)) {
+        distinctColNames.push(r.columnName);
+      }
+      if (distinctColNames.length >= 2) break;
+    }
+    const col1Name = distinctColNames[0] || 'Column 1';
+    const col2Name = distinctColNames[1] || 'Column 2';
+
+    // Pivot table rows using deterministic columnName matching
     const rowMap = new Map<number, any>();
     dbRows.forEach((r: any) => {
       if (!rowMap.has(r.rowIndex)) {
@@ -443,8 +495,8 @@ app.get('/api/runs/:runId/rows', requireAuth, async (req: any, res: any) => {
       }
       const entry = rowMap.get(r.rowIndex);
       
-      // Determine if it is column 1 or column 2
-      const isCol1 = r.id === dbRows.filter((x: any) => x.rowIndex === r.rowIndex)[0].id;
+      // Determine if it is column 1 or column 2 by matching column name
+      const isCol1 = r.columnName === col1Name;
       if (isCol1) {
         entry.col1Value = r.value;
         entry.col1Confidence = r.ocrConfidence;
@@ -536,14 +588,38 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
     const xTransform = experiment.xTransform || 'none';
     const yTransform = experiment.yTransform || 'none';
 
-    // Pivot rows to raw XY pairs
+    // Determine column name → X/Y mapping using the experiment recipe
+    let expectedColumns: string[] = [];
+    try {
+      expectedColumns = experiment.rawColumns ? JSON.parse(experiment.rawColumns) : [];
+    } catch (_) { /* ignore parse error */ }
+    const plotX = experiment.plotXColumn ?? 0;
+    const plotY = experiment.plotYColumn ?? 1;
+    const xColName = expectedColumns[plotX] || null;
+    const yColName = expectedColumns[plotY] || null;
+
+    // Collect distinct column names from actual data
+    const distinctCols: string[] = [];
+    for (const r of dbRows as any[]) {
+      if (!distinctCols.includes(r.columnName)) {
+        distinctCols.push(r.columnName);
+      }
+      if (distinctCols.length >= 2) break;
+    }
+
+    // Build a reliable columnName → axis assignment
+    // Priority: match against experiment's rawColumns[plotXColumn]/rawColumns[plotYColumn]
+    // Fallback: first distinct column = X, second = Y
+    const resolvedXCol = xColName && distinctCols.includes(xColName) ? xColName : distinctCols[0];
+    const resolvedYCol = yColName && distinctCols.includes(yColName) ? yColName : distinctCols[1] || distinctCols[0];
+
+    // Pivot rows to raw XY pairs using deterministic column name matching
     const rawPairs: { x: number; y: number }[] = [];
     const rowMap = new Map<number, { x?: number; y?: number }>();
     dbRows.forEach((r: any) => {
       if (!rowMap.has(r.rowIndex)) rowMap.set(r.rowIndex, {});
       const pair = rowMap.get(r.rowIndex)!;
-      const isCol1 = r.id === dbRows.filter((x: any) => x.rowIndex === r.rowIndex)[0].id;
-      if (isCol1) pair.x = r.value;
+      if (r.columnName === resolvedXCol) pair.x = r.value;
       else pair.y = r.value;
     });
 
@@ -588,22 +664,30 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
       rSquared = sst !== 0 ? 1 - (ssr / sst) : 1.0;
     }
 
-    // Determine axis labels from experiment recipe
-    const col1RawName = dbRows[0]?.columnName || 'X';
-    const col2RawName = dbRows.find((r: any) => r.id !== dbRows.filter((x: any) => x.rowIndex === dbRows[0].rowIndex)[0].id)?.columnName || 'Y';
-    const col1Unit = dbRows[0]?.unit || '';
-    const col2Unit = dbRows.find((r: any) => r.id !== dbRows.filter((x: any) => x.rowIndex === dbRows[0].rowIndex)[0].id)?.unit || '';
+    // Determine axis labels using resolved column names
+    const xRawName = resolvedXCol || 'X';
+    const yRawName = resolvedYCol || 'Y';
+    // Find unit for x and y columns from actual data
+    const xUnit = (dbRows as any[]).find((r: any) => r.columnName === resolvedXCol)?.unit || '';
+    const yUnit = (dbRows as any[]).find((r: any) => r.columnName === resolvedYCol)?.unit || '';
 
-    const xLabel = experiment.xAxisLabel || `${getTransformLabel(col1RawName, xTransform)} (${col1Unit})`;
-    const yLabel = experiment.yAxisLabel || `${getTransformLabel(col2RawName, yTransform)} (${col2Unit})`;
+    const xLabel = experiment.xAxisLabel || `${getTransformLabel(xRawName, xTransform)} (${xUnit})`;
+    const yLabel = experiment.yAxisLabel || `${getTransformLabel(yRawName, yTransform)} (${yUnit})`;
 
-    // Calculate dynamic boundaries with 20% padding
+    // Calculate dynamic boundaries from ACTUAL data with 15% padding
+    // No hardcoded minimum floors — axis range reflects the real data
     const xVals = pairs.map((p) => p.x);
     const yVals = pairs.map((p) => p.y);
-    const xAxisMin = Math.min(...xVals, 0);
-    const xAxisMax = Math.max(...xVals, 5) * 1.2;
-    const yAxisMin = Math.min(...yVals, 0);
-    const yAxisMax = Math.max(...yVals, 50) * 1.2;
+    const xDataMin = Math.min(...xVals);
+    const xDataMax = Math.max(...xVals);
+    const yDataMin = Math.min(...yVals);
+    const yDataMax = Math.max(...yVals);
+    const xRange = xDataMax - xDataMin || 1; // avoid zero range
+    const yRange = yDataMax - yDataMin || 1;
+    const xAxisMin = Math.min(xDataMin - xRange * 0.1, 0); // include 0 if data is all positive
+    const xAxisMax = xDataMax + xRange * 0.15;
+    const yAxisMin = Math.min(yDataMin - yRange * 0.1, 0);
+    const yAxisMax = yDataMax + yRange * 0.15;
 
     const suggestedScale = `1 small division = ${(xAxisMax / 50).toFixed(2)} on X-axis, ${(yAxisMax / 50).toFixed(2)} on Y-axis`;
 
@@ -615,14 +699,14 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
       // Show transformation steps
       calculationText += `Step 1: Apply data transformations\n`;
       if (xTransform === 'square') {
-        calculationText += `X-axis: ${col1RawName} → ${col1RawName}² (squared)\n`;
+        calculationText += `X-axis: ${xRawName} → ${xRawName}² (squared)\n`;
       } else if (xTransform === 'log') {
-        calculationText += `X-axis: ${col1RawName} → log₁₀(${col1RawName})\n`;
+        calculationText += `X-axis: ${xRawName} → log₁₀(${xRawName})\n`;
       }
       if (yTransform === 'square') {
-        calculationText += `Y-axis: ${col2RawName} → ${col2RawName}² (squared)\n`;
+        calculationText += `Y-axis: ${yRawName} → ${yRawName}² (squared)\n`;
       } else if (yTransform === 'log') {
-        calculationText += `Y-axis: ${col2RawName} → log₁₀(${col2RawName})\n`;
+        calculationText += `Y-axis: ${yRawName} → log₁₀(${yRawName})\n`;
       }
       calculationText += `\n`;
     }
@@ -636,39 +720,106 @@ app.post('/api/runs/:runId/graph', requireAuth, async (req: any, res: any) => {
     calculationText += `Step ${xTransform !== 'none' || yTransform !== 'none' ? '4' : '3'}: R² (goodness of fit)\n`;
     calculationText += `R² = ${rSquared.toFixed(4)}\n\n`;
 
-    // Experiment-specific derived calculations
+    // Experiment-specific derived calculations with physics sanity checks
     if (expName === "Ohm's Law") {
       let factor = 1.0;
-      if (col2Unit === 'mA') factor = 1000.0;
-      else if (col2Unit === 'µA') factor = 1000000.0;
+      if (yUnit === 'mA') factor = 1000.0;
+      else if (yUnit === 'µA') factor = 1000000.0;
       const resistance = slope !== 0 ? factor / slope : 100.0;
       calculationText += `Step 4: Calculate Resistance\n`;
       calculationText += `R = 1 / slope = 1 / ${(slope / factor).toFixed(6)} A/V = ${resistance.toFixed(1)} Ω`;
+      // Sanity: slope must be positive (current increases with voltage)
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Slope is ${slope <= 0 ? 'non-positive' : 'zero'}. For Ohm's Law, current must increase with voltage (positive slope). Check if X/Y columns are swapped.`;
+      }
     } else if (expName === 'Simple Pendulum') {
-      // slope = T²/L → g = 4π²/slope
-      const g = slope !== 0 ? (4 * Math.PI * Math.PI) / (slope / 100) : 9.8; // convert cm to m
+      // slope = T²/L → g = 4π²/slope (with cm→m conversion)
+      const slopeInSI = slope / 100; // cm → m
+      const g = slopeInSI !== 0 ? (4 * Math.PI * Math.PI) / slopeInSI : 9.8;
       calculationText += `Step 5: Calculate g from slope\n`;
       calculationText += `slope = T²/L = ${slope.toFixed(4)} s²/cm\n`;
-      calculationText += `g = 4π²/slope = 4 × ${Math.PI.toFixed(4)}² / ${(slope / 100).toFixed(4)} = ${g.toFixed(2)} m/s²`;
+      calculationText += `g = 4π²/slope = 4 × ${Math.PI.toFixed(4)}² / ${slopeInSI.toFixed(6)} = ${g.toFixed(2)} m/s²`;
+      // Sanity: slope must be positive, g should be ~9.8 m/s²
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Slope is non-positive. T² must increase with L (positive slope).`;
+      } else if (Math.abs(g - 9.81) > 2.0) {
+        calculationText += `\n\n⚠️ Physics Note: Calculated g = ${g.toFixed(2)} m/s² deviates significantly from 9.81 m/s². Check units and data.`;
+      }
     } else if (expName === "Stefan's Law") {
       calculationText += `Step 5: Verify Stefan's Law\n`;
       calculationText += `Expected slope ≈ 4 (since P ∝ T⁴)\n`;
       calculationText += `Measured slope = ${slope.toFixed(2)}\n`;
       calculationText += `${Math.abs(slope - 4) < 0.5 ? '✓ Stefan\'s Law is verified!' : 'Note: Deviation from expected value of 4.'}`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Slope must be positive (log P increases with log T).`;
+      }
     } else if (expName === "Newton's Rings") {
       calculationText += `Step 5: Calculate wavelength\n`;
       calculationText += `slope = D²/n = ${slope.toFixed(4)} cm²\n`;
       calculationText += `λ = slope / (4R) (where R is the radius of curvature of the lens)`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Slope must be positive (D² increases with ring number n).`;
+      }
     } else if (expName === "Hooke's Law (Spring)") {
       const k = slope;
       calculationText += `Step 4: Calculate spring constant\n`;
       calculationText += `k = slope = ${k.toFixed(3)} N/cm = ${(k * 100).toFixed(1)} N/m`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Spring constant k must be positive (force increases with extension).`;
+      }
     } else if (expName === "Planck's Constant (LED)") {
       const e = 1.6e-19;
       const h = slope * e * 1e-14; // frequency in 10^14 Hz
       calculationText += `Step 5: Calculate Planck's constant\n`;
       calculationText += `slope = h/e = ${slope.toFixed(4)} V/(10¹⁴ Hz)\n`;
       calculationText += `h = slope × e = ${h.toExponential(2)} J·s`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Slope must be positive (stopping voltage increases with frequency). Check column assignment.`;
+      }
+    } else if (expName === "Young's Modulus") {
+      calculationText += `Step 4: Calculate Young's Modulus\n`;
+      calculationText += `slope = ΔL/F → Y = (F × L₀) / (A × ΔL)\n`;
+      calculationText += `Best-fit slope = ${slope.toFixed(6)}`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Extension must increase with load (positive slope).`;
+      }
+    } else if (expName === 'Cooling of Water') {
+      calculationText += `Step 4: Verify Newton's Law of Cooling\n`;
+      calculationText += `The temperature should decrease exponentially over time.\n`;
+      calculationText += `Linear fit slope = ${slope.toFixed(4)} °C/s (approximate rate of cooling)`;
+      if (slope >= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Temperature must decrease with time (negative slope for cooling).`;
+      }
+    } else if (expName === 'Meter Bridge') {
+      calculationText += `Step 4: Calculate unknown resistance\n`;
+      calculationText += `Using R/S = l/(100-l), the balance length relationship gives the resistance ratio.\n`;
+      calculationText += `Best-fit slope = ${slope.toFixed(4)}`;
+    } else if (expName === 'Potentiometer (EMF)') {
+      calculationText += `Step 4: Compare EMFs\n`;
+      calculationText += `E₁/E₂ = l₁/l₂\n`;
+      calculationText += `Best-fit slope = ${slope.toFixed(4)}`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Slope must be positive (EMF proportional to balance length).`;
+      }
+    } else if (expName === 'PN Junction Diode (Forward Bias)') {
+      calculationText += `Step 4: Forward bias V-I analysis\n`;
+      calculationText += `Above the knee voltage (~0.6V for Si, ~0.3V for Ge), current rises exponentially.\n`;
+      calculationText += `Linear region slope = ${slope.toFixed(4)} (dynamic resistance ≈ ${slope !== 0 ? (1/slope).toFixed(2) : '∞'} Ω)`;
+      if (slope <= 0) {
+        calculationText += `\n\n⚠️ Physics Warning: Forward current must increase with forward voltage (positive slope).`;
+      }
+    } else if (expName === 'PN Junction Diode (Reverse Bias)') {
+      calculationText += `Step 4: Reverse bias V-I analysis\n`;
+      calculationText += `In reverse bias, current should be very small (saturation current ≈ µA).\n`;
+      calculationText += `Best-fit slope = ${slope.toFixed(6)}`;
+    } else if (expName === 'Zener Diode') {
+      calculationText += `Step 4: Zener diode analysis\n`;
+      calculationText += `In the breakdown region, voltage remains approximately constant at V_Z.\n`;
+      calculationText += `Best-fit slope = ${slope.toFixed(4)}`;
+    } else if (expName === 'Optical Fibre') {
+      calculationText += `Step 4: Numerical Aperture calculation\n`;
+      calculationText += `NA = sin(θ_max) where θ_max is the maximum acceptance angle.\n`;
+      calculationText += `Best-fit slope = ${slope.toFixed(4)}`;
     } else {
       // Generic
       calculationText += `The best-fit line equation is: y = ${slope.toFixed(4)}x + ${intercept.toFixed(4)}`;

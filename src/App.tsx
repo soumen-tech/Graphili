@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { Cpu, Zap, Award, Star, FileDown, ChevronRight, ArrowLeft, RefreshCw, Layers, ZoomIn, ZoomOut, Printer, LogOut, Key } from 'lucide-react';
 import { supabase } from './supabaseClient';
 import * as api from './api';
+import { getUnitsForColumn } from './unitTaxonomy';
 
 // Import Components
 import { NotebookPage } from './components/NotebookPage';
@@ -102,8 +103,8 @@ export default function App() {
   };
 
   // Column configurations
-  const [col1Config, setCol1Config] = useState({ name: 'Voltage', unit: 'V', availableUnits: ['V', 'mV', 'kV'] });
-  const [col2Config, setCol2Config] = useState({ name: 'Current', unit: 'mA', availableUnits: ['mA', 'A', 'µA'] });
+  const [col1Config, setCol1Config] = useState({ name: 'Voltage', unit: 'V', availableUnits: getUnitsForColumn('Voltage', 'V') });
+  const [col2Config, setCol2Config] = useState({ name: 'Current', unit: 'mA', availableUnits: getUnitsForColumn('Current', 'mA') });
 
   // Graph Canvas specific states
   const [graphGrid, setGraphGrid] = useState<boolean>(true);
@@ -360,7 +361,13 @@ export default function App() {
       setProcessingStep(1);
 
       // Step 1: Extracting values... (Upload to Cloudinary)
-      const imageUrl = await api.uploadPhoto(file);
+      let imageUrl = '';
+      try {
+        imageUrl = await api.uploadPhoto(file);
+      } catch (uploadErr: any) {
+        console.error('[Upload Stage] Cloudinary upload failed:', uploadErr);
+        throw new Error(`[Upload Stage] Image upload failed: ${uploadErr.message || uploadErr}`);
+      }
       setCurrentRunImage(imageUrl);
       setProcessingProgress(35);
       setProcessingStep(2);
@@ -381,7 +388,13 @@ export default function App() {
       // Step 3: Checking accuracy... (Gemini OCR)
       setProcessingStep(3);
       setProcessingProgress(55);
-      const ocrResult = await api.createRun(selectedExperimentId!, imageUrl);
+      let ocrResult;
+      try {
+        ocrResult = await api.createRun(selectedExperimentId!, imageUrl);
+      } catch (ocrErr: any) {
+        console.error('[AI OCR Stage] Gemini OCR call failed:', ocrErr);
+        throw new Error(`[AI OCR Stage] AI reading failed: ${ocrErr.message || ocrErr}`);
+      }
 
       // Check for structured error from server
       if (!ocrResult.success) {
@@ -407,12 +420,12 @@ export default function App() {
       setCol1Config({
         name: ocrResult.col1Config?.name || 'X',
         unit: ocrResult.col1Config?.unit || '',
-        availableUnits: [ocrResult.col1Config?.unit || '', 'V', 'mV', 'kV', 'ms', 's', 'Hz', 'kHz', 'cm', 'N', 'mm', 'min', '°C', 'Ω', 'µA', 'µW'].filter(Boolean)
+        availableUnits: getUnitsForColumn(ocrResult.col1Config?.name || 'X', ocrResult.col1Config?.unit)
       });
       setCol2Config({
         name: ocrResult.col2Config?.name || 'Y',
         unit: ocrResult.col2Config?.unit || '',
-        availableUnits: [ocrResult.col2Config?.unit || '', 'mA', 'A', 'µA', 'V', 'mV', 's²', 'cm²', 'N', 'mm', '°C', 'Ω', 'W', 'µW'].filter(Boolean)
+        availableUnits: getUnitsForColumn(ocrResult.col2Config?.name || 'Y', ocrResult.col2Config?.unit)
       });
 
       // Step 5: Almost done...
@@ -471,12 +484,12 @@ export default function App() {
       setCol1Config({
         name: headerCells[0] || 'Column 1',
         unit: '',
-        availableUnits: ['V', 'mV', 'kV', 'ms', 's', 'Hz', 'kHz', 'cm', 'N', 'mm', 'min', '°C', 'Ω']
+        availableUnits: getUnitsForColumn(headerCells[0] || 'Column 1')
       });
       setCol2Config({
         name: headerCells[1] || 'Column 2',
         unit: '',
-        availableUnits: ['mA', 'A', 'µA', 'V', 'mV', 's²', 'cm²', 'N', 'mm', '°C', 'Ω', 'W']
+        availableUnits: getUnitsForColumn(headerCells[1] || 'Column 2')
       });
 
       // Skip upload/processing and go straight to editor
@@ -1413,6 +1426,7 @@ export default function App() {
                         yTransform={currentExperimentDetail?.yTransform}
                         xAxisLabel={graphResult?.xAxisLabelText || currentExperimentDetail?.xAxisLabel || undefined}
                         yAxisLabel={graphResult?.yAxisLabelText || currentExperimentDetail?.yAxisLabel || undefined}
+                        graphResult={graphResult}
                       />
                     </div>
                   </div>
@@ -1929,12 +1943,12 @@ export default function App() {
                               setCol1Config({
                                 name: fetched.col1Config.name || 'X',
                                 unit: fetched.col1Config.unit || '',
-                                availableUnits: [fetched.col1Config.unit || '', 'V', 'mV', 'kV', 'ms', 's', 'Hz', 'kHz'].filter(Boolean)
+                                availableUnits: getUnitsForColumn(fetched.col1Config.name || 'X', fetched.col1Config.unit)
                               });
                               setCol2Config({
                                 name: fetched.col2Config.name || 'Y',
                                 unit: fetched.col2Config.unit || '',
-                                availableUnits: [fetched.col2Config.unit || '', 'mA', 'A', 'µA', 'V', 'mV'].filter(Boolean)
+                                availableUnits: getUnitsForColumn(fetched.col2Config.name || 'Y', fetched.col2Config.unit)
                               });
 
                               // Load graph results

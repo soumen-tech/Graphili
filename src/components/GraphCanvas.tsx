@@ -11,6 +11,15 @@ interface GraphCanvasProps {
   yTransform?: string;
   xAxisLabel?: string;
   yAxisLabel?: string;
+  // Backend-provided axis bounds (preferred when available)
+  graphResult?: {
+    xAxisMin?: number;
+    xAxisMax?: number;
+    yAxisMin?: number;
+    yAxisMax?: number;
+    slope?: number;
+    intercept?: number;
+  } | null;
 }
 
 function applyTransform(value: number, transform?: string): number {
@@ -33,6 +42,7 @@ export const GraphCanvas = ({
   yTransform = 'none',
   xAxisLabel,
   yAxisLabel,
+  graphResult,
 }: GraphCanvasProps) => {
   // SVG size parameters
   const width = 500;
@@ -53,27 +63,59 @@ export const GraphCanvas = ({
     }));
   }, [data, xTransform, yTransform]);
 
-  // Find data ranges based on transformed values
-  const maxVoltage = useMemo(() => Math.max(...transformedData.map(d => d.voltage), 5), [transformedData]);
-  const maxCurrent = useMemo(() => Math.max(...transformedData.map(d => d.current), 50), [transformedData]);
+  // Compute axis ranges from data with proper padding — NO hardcoded floors
+  const { xMin, xMax, yMin, yMax } = useMemo(() => {
+    // If backend provided bounds, prefer those
+    if (graphResult?.xAxisMax !== undefined && graphResult?.yAxisMax !== undefined) {
+      return {
+        xMin: graphResult.xAxisMin ?? 0,
+        xMax: graphResult.xAxisMax,
+        yMin: graphResult.yAxisMin ?? 0,
+        yMax: graphResult.yAxisMax,
+      };
+    }
+
+    // Otherwise compute from transformed data
+    const xVals = transformedData.map(d => d.voltage);
+    const yVals = transformedData.map(d => d.current);
+
+    if (xVals.length === 0) return { xMin: 0, xMax: 1, yMin: 0, yMax: 1 };
+
+    const xDataMin = Math.min(...xVals);
+    const xDataMax = Math.max(...xVals);
+    const yDataMin = Math.min(...yVals);
+    const yDataMax = Math.max(...yVals);
+    const xRange = xDataMax - xDataMin || 1;
+    const yRange = yDataMax - yDataMin || 1;
+
+    return {
+      xMin: Math.min(xDataMin - xRange * 0.1, 0),
+      xMax: xDataMax + xRange * 0.15,
+      yMin: Math.min(yDataMin - yRange * 0.1, 0),
+      yMax: yDataMax + yRange * 0.15,
+    };
+  }, [transformedData, graphResult]);
 
   // Linear Regression (y = mx + c) on transformed values
   const regression = useMemo(() => {
+    // Prefer backend values if available
+    if (graphResult?.slope !== undefined && graphResult?.intercept !== undefined) {
+      return { slope: graphResult.slope, intercept: graphResult.intercept };
+    }
+
     const n = transformedData.length;
-    if (n < 2) return { slope: 0, intercept: 0, r2: 0 };
+    if (n < 2) return { slope: 0, intercept: 0 };
     
     let sumX = 0;
     let sumY = 0;
     let sumXY = 0;
     let sumXX = 0;
-    let sumYY = 0;
     
     transformedData.forEach(d => {
       sumX += d.voltage;
       sumY += d.current;
       sumXY += d.voltage * d.current;
       sumXX += d.voltage * d.voltage;
-      sumYY += d.current * d.current;
     });
     
     const slopeNum = (n * sumXY) - (sumX * sumY);
@@ -82,31 +124,48 @@ export const GraphCanvas = ({
     const intercept = (sumY - (slope * sumX)) / n;
     
     return { slope, intercept };
-  }, [transformedData]);
+  }, [transformedData, graphResult]);
 
-  // Coordinate Conversion Functions
+  // Coordinate Conversion Functions using computed ranges
   const getX = (voltage: number) => {
-    const range = maxVoltage * 1.15; // padding factor
+    const range = xMax - xMin || 1;
     const scale = (width - paddingLeft - paddingRight) / range;
-    return paddingLeft + voltage * scale;
+    return paddingLeft + (voltage - xMin) * scale;
   };
 
   const getY = (current: number) => {
-    const range = maxCurrent * 1.15;
+    const range = yMax - yMin || 1;
     const scale = (height - paddingTop - paddingBottom) / range;
-    return height - paddingBottom - current * scale;
+    return height - paddingBottom - (current - yMin) * scale;
   };
 
-  // Generate grid ticks
+  // Generate grid ticks with nice round numbers
   const xTicks = useMemo(() => {
     const steps = 6;
-    return Array.from({ length: steps }).map((_, i) => (maxVoltage / (steps - 1)) * i);
-  }, [maxVoltage]);
+    return Array.from({ length: steps }).map((_, i) => xMin + ((xMax - xMin) / (steps - 1)) * i);
+  }, [xMin, xMax]);
 
   const yTicks = useMemo(() => {
     const steps = 6;
-    return Array.from({ length: steps }).map((_, i) => (maxCurrent / (steps - 1)) * i);
-  }, [maxCurrent]);
+    return Array.from({ length: steps }).map((_, i) => yMin + ((yMax - yMin) / (steps - 1)) * i);
+  }, [yMin, yMax]);
+
+  // Determine appropriate decimal places for tick labels
+  const xDecimalPlaces = useMemo(() => {
+    const range = xMax - xMin;
+    if (range > 100) return 0;
+    if (range > 10) return 1;
+    if (range > 1) return 2;
+    return 3;
+  }, [xMin, xMax]);
+
+  const yDecimalPlaces = useMemo(() => {
+    const range = yMax - yMin;
+    if (range > 100) return 0;
+    if (range > 10) return 1;
+    if (range > 1) return 2;
+    return 3;
+  }, [yMin, yMax]);
 
   return (
     <div className="relative w-full border-2 border-ink-primary bg-paper-card rounded-xl shadow-[3px_3px_0px_0px_rgba(44,62,80,1)] overflow-hidden">
@@ -171,7 +230,7 @@ export const GraphCanvas = ({
                   y={height - paddingBottom + 16} 
                   textAnchor="middle"
                 >
-                  {tick.toFixed(1)}
+                  {tick.toFixed(xDecimalPlaces)}
                 </text>
               </g>
             ))}
@@ -192,7 +251,7 @@ export const GraphCanvas = ({
                   y={getY(tick) + 3} 
                   textAnchor="end"
                 >
-                  {tick.toFixed(0)}
+                  {tick.toFixed(yDecimalPlaces)}
                 </text>
               </g>
             ))}
@@ -222,16 +281,25 @@ export const GraphCanvas = ({
 
           {/* Best Fit Line */}
           {showBestFit && transformedData.length >= 2 && (
-            <line
-              x1={getX(0)}
-              y1={getY(regression.intercept)}
-              x2={getX(maxVoltage)}
-              y2={getY(regression.slope * maxVoltage + regression.intercept)}
-              stroke="var(--color-accent-orange)"
-              strokeWidth="2.5"
-              strokeDasharray="4 3"
-              className="drop-shadow-[1px_1px_1px_rgba(0,0,0,0.15)]"
-            />
+            (() => {
+              // Compute line endpoints clipped to the visible axis range
+              const lineX1 = xMin;
+              const lineY1 = regression.slope * lineX1 + regression.intercept;
+              const lineX2 = xMax;
+              const lineY2 = regression.slope * lineX2 + regression.intercept;
+              return (
+                <line
+                  x1={getX(lineX1)}
+                  y1={getY(lineY1)}
+                  x2={getX(lineX2)}
+                  y2={getY(lineY2)}
+                  stroke="var(--color-accent-orange)"
+                  strokeWidth="2.5"
+                  strokeDasharray="4 3"
+                  className="drop-shadow-[1px_1px_1px_rgba(0,0,0,0.15)]"
+                />
+              );
+            })()
           )}
 
           {/* Data Points */}
